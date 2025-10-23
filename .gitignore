@@ -1,6 +1,3 @@
-# But keep these folders
-!data/
-!ckpts/
 # Ignore all files in data/ and ckpts/
 data/*
 ckpts/*
