@@ -1,0 +1,9 @@
+# Ignore all files in data/ and ckpts/
+data/*
+ckpts/*
+
+helper_session.ipynb
+
+# But keep these folders
+!data/
+!ckpts/
