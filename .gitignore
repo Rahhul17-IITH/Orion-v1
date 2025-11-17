@@ -1,0 +1,14 @@
+# Ignore all files in data/ and ckpts/
+data/*
+ckpts/*
+build/*
+.dist_test/*
+Bench2Drive-mini/*
+mmcv.egg-info/*
+
+helper_session.ipynb
+b2d_maps.ipynb
+helper_session.ipynb
+tars_to_v1.ipynb
+util_scripts.ipynb
+README.md
