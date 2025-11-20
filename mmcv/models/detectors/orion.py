@@ -492,7 +492,7 @@ class Orion(MVXTwoStageDetector):
             input_ids = None
             vlm_labels = None
             vlm_attn_mask = None
-        # img_metas = [img_metas[0][0]] # BUG:ÃƒÂ¨Ã‚Â¿Ã¢â€žÂ¢ÃƒÂ¦Ã‚Â Ã‚Â·ÃƒÂ¤Ã‚Â¸Ã‚ÂÃƒÂ¦Ã‹Å“Ã‚Â¯seq
+        # img_metas = [img_metas[0][0]] # BUG:ÃƒÆ’Ã‚Â¨Ãƒâ€šÃ‚Â¿ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã‚Â¦Ãƒâ€šÃ‚Â Ãƒâ€šÃ‚Â·ÃƒÆ’Ã‚Â¤Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¦Ãƒâ€¹Ã…â€œÃƒâ€šÃ‚Â¯seq
         img_metas = [img_meta[0] for img_meta in img_metas]
 
         data['img_feats'] = self.extract_feat(data['img'])
@@ -726,8 +726,7 @@ class Orion(MVXTwoStageDetector):
         if self.with_pts_bbox:
             outs, det_query = self.pts_bbox_head(img_metas, pos_embed, **data)
             vision_embeded_obj = det_query.clone()
-            # Save det_query embeddings
-            np.save(os.path.join(output_dir, 'vision_obj_embeddings.npy'), vision_embeded_obj.cpu().numpy())
+           
             if self.use_col_loss:
                 bbox_list = self.pts_bbox_head.get_motion_bboxes(
                 outs, img_metas)
@@ -745,8 +744,6 @@ class Orion(MVXTwoStageDetector):
         if self.with_map_head:
             outs, map_query = self.map_head(img_metas, pos_embed, **data)
             vision_embeded_map = map_query.clone()
-            # Save map_query embeddings
-            np.save(os.path.join(output_dir, 'vision_map_embeddings.npy'), vision_embeded_map.cpu().numpy())
             lane_results = self.map_head.get_bboxes(outs, img_metas)
         generated_text = []
         metric_dict = {}
@@ -766,9 +763,6 @@ class Orion(MVXTwoStageDetector):
                     bbox_result['scores_3d'] = bbox_result['scores_3d'][mask]
                     bbox_result['labels_3d'] = bbox_result['labels_3d'][mask]
                     bbox_result['trajs_3d'] = bbox_result['trajs_3d'][mask]
-                    # Save bounding box and lane detection results
-                    np.save(os.path.join(output_dir, 'bbox_results.npy'), bbox_results)
-                    np.save(os.path.join(output_dir, 'lane_results.npy'), lane_results)
                     # matched_bbox_result = self.assign_pred_to_gt_vip3d(
                     #     bbox_result, gt_bbox, gt_label)
 
@@ -805,8 +799,8 @@ class Orion(MVXTwoStageDetector):
                         use_cache=True,
                         return_ego_feature=True
                     )
-                    # Save ego_feature token output
-                    np.save(os.path.join(output_dir, 'ego_feature.npy'), ego_feature.cpu().numpy())
+                    
+                    
                     ego_feature = ego_feature.to(torch.float32)
                     current_states = ego_feature.unsqueeze(1)
                     if not self.use_diff_decoder and not self.use_mlp_decoder: # VAE-based generate 
@@ -833,7 +827,7 @@ class Orion(MVXTwoStageDetector):
                             ego_fut_trajs_list.append(outputs_ego_trajs)
 
                         ego_fut_preds = torch.stack(ego_fut_trajs_list, dim=2)
-                        np.save(os.path.join(output_dir, 'ego_fut_preds_vae.npy'), ego_fut_preds.cpu().numpy())
+                        
                     elif self.use_diff_decoder:
                         step_num = 2
                         bs = ego_feature.shape[0]
@@ -891,11 +885,10 @@ class Orion(MVXTwoStageDetector):
                         mode_masks = mode_masks.to(torch.bool)
                         # best_reg = poses_reg[mode_masks]
                         ego_fut_preds = poses_reg
-                        np.save(os.path.join(output_dir, 'ego_fut_preds_diffusion.npy'), ego_fut_preds.cpu().numpy())
+                    
                     elif self.use_mlp_decoder:
                         waypoint = self.waypoint_decoder(current_states)
                         waypoint = waypoint.reshape(-1,2)
-                        np.save(os.path.join(output_dir, 'ego_waypoints.npy'), waypoint.cpu().numpy())
                 else:
                     history_input_output_id.append(input_ids)
                     context_input_ids = torch.cat(history_input_output_id,dim=-1)
@@ -914,10 +907,6 @@ class Orion(MVXTwoStageDetector):
                         Q=img_metas[0]['vlm_labels'].data[i],
                         A=self.tokenizer.batch_decode(output_ids, skip_special_tokens=True),
                     ))
-                    if generated_text:
-                        with open(os.path.join(output_dir, 'generated_text.json'), 'w') as f:
-                            json.dump(generated_text, f)
-                    history_input_output_id.append(output_ids)
  
             full_match = False
             if not self.qa_pretrain:
@@ -962,7 +951,7 @@ class Orion(MVXTwoStageDetector):
                             gt_ego_fut_trajs = ego_fut_trajs[None].to('cpu'),
                             gt_agent_boxes = gt_bbox,
                             gt_agent_feats = gt_attr_label.unsqueeze(0),
-                            fut_valid_flag = fut_valid_flag # ÃƒÂ¥Ã‚Â½Ã¢â‚¬Å“ÃƒÂ¥Ã¢â‚¬Â°Ã‚ÂÃƒÂ¥Ã‚Â¸Ã‚Â§ÃƒÂ¦Ã‹Å“Ã‚Â¯ÃƒÂ¥Ã‚ÂÃ‚Â¦ÃƒÂ¦Ã‚Â¶Ã‚ÂµÃƒÂ§Ã¢â‚¬ÂºÃ¢â‚¬â€œ6ÃƒÂ¤Ã‚Â¸Ã‚ÂªÃƒÂ¨Ã‚Â½Ã‚Â¨ÃƒÂ¨Ã‚Â¿Ã‚Â¹
+                            fut_valid_flag = fut_valid_flag # ÃƒÆ’Ã‚Â¥Ãƒâ€šÃ‚Â½ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œÃƒÆ’Ã‚Â¥ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€šÃ‚ÂÃƒÆ’Ã‚Â¥Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â§ÃƒÆ’Ã‚Â¦Ãƒâ€¹Ã…â€œÃƒâ€šÃ‚Â¯ÃƒÆ’Ã‚Â¥Ãƒâ€šÃ‚ÂÃƒâ€šÃ‚Â¦ÃƒÆ’Ã‚Â¦Ãƒâ€šÃ‚Â¶Ãƒâ€šÃ‚ÂµÃƒÆ’Ã‚Â§ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂºÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“6ÃƒÆ’Ã‚Â¤Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚ÂªÃƒÆ’Ã‚Â¨Ãƒâ€šÃ‚Â½Ãƒâ€šÃ‚Â¨ÃƒÆ’Ã‚Â¨Ãƒâ€šÃ‚Â¿Ãƒâ€šÃ‚Â¹
                         )
                     metric_dict.update(metric_dict_planner_stp3)
                     lane_results[0]['fut_valid_flag'] = fut_valid_flag
