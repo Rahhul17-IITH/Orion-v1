@@ -303,16 +303,16 @@ model = dict(
 )
 
 dataset_type = "B2DOrionDataset"
-data_root = "data/bench2drive"
-info_root = "data/infos"
-map_root = "data/bench2drive/maps"
-map_file = "data/infos/b2d_map_infos.pkl"
+data_root = "/content/data1/data/bench2drive"
+info_root = "/content/data1/data/infos"
+map_root = "/content/data1/data/bench2drive/maps"
+map_file = "/content/data1/data/infos/b2d_map_infos.pkl"
 
 file_client_args = dict(backend="disk")
 ann_file_test=info_root + f"/b2d_infos_val.pkl"
 
 test_pipeline = [
-    dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True),
+    dict(type='LoadMultiViewImageFromFilesInCeph', to_float32=True, file_client_args=file_client_args),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True, with_attr_label=True),
     dict(type='VADObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='VADObjectNameFilter', classes=class_names),
@@ -345,7 +345,7 @@ test_pipeline = [
 
 data = dict(
     samples_per_gpu=batch_size,
-    workers_per_gpu=4,
+    workers_per_gpu=0,
     test=dict(
         type=dataset_type,
         data_root=data_root,
