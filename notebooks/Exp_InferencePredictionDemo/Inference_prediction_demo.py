@@ -1,9 +1,9 @@
 # ========================================================================
-# ORION INFERENCE DEMO V72 (Z-CORRECTION & BEV SWAP)
+# ORION INFERENCE DEMO V76 (HYBRID FIX: LIB STRUCTURES + LOCAL DRAW)
 # ========================================================================
-# 1. FIXED: Re-enabled LIDAR_HEIGHT_CORRECTION (Fixes hovering lanes/boxes).
-# 2. FIXED: Swapped X/Y in BEV (Fixes perpendicular lane alignment).
-# 3. FIXED: Optimized thresholds (0.25) to catch front car.
+# 1. FIXED: Forced LOCAL drawing functions to bypass 'np.int' library crash.
+# 2. RETAINED: Library 'LiDARInstance3DBoxes' (User Preference).
+# 3. RETAINED: Z-Correction (-1.85m) and thresholds (0.1) for detection.
 # ========================================================================
 
 import cv2
@@ -14,10 +14,15 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["cv_num_threads"] = "1"
 
 # ========================================================================
-# IMPORTS
+# IMPORTS & GLOBAL PATCH
 # ========================================================================
 import torch
 import numpy as np
+
+# CRITICAL PATCH: Restore np.int for any other legacy library calls
+if not hasattr(np, 'int'):
+    np.int = int
+
 import imageio
 import gc
 import sys
@@ -36,22 +41,17 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # --- Constants ---
-# CRITICAL: Model outputs Ego Frame (Ground=0). Lidar2Img expects Lidar Frame (Roof=0).
-# We must shift Z down by the sensor height to align them.
 LIDAR_HEIGHT_CORRECTION = 1.85 
 
 # --- ORION Placeholder Class ---
 class ORION:
     pass
 
-# --- NATIVE ORION FUNCTION IMPORTS (With Robust Fallbacks) ---
+# --- 1. LIBRARY STRUCTURES (Use Library as requested) ---
 try:
     from mmcv.core.bbox.structures.lidar_box3d import LiDARInstance3DBoxes
-    from mmcv.core.visualizer.image_vis import draw_lidar_bbox3d_on_img, plot_rect3d_on_img
-    from mmcv.core.bbox.box_np_ops import points_cam2img
 except ImportError:
-    print("Warning: Native ORION functions not found. Using strict local implementations.")
-    
+    print("Warning: Library LiDARInstance3DBoxes not found. Using local fallback.")
     class LiDARInstance3DBoxes:
         def __init__(self, tensor, box_dim=7, origin=(0.5, 0.5, 0)):
             self.tensor = tensor
@@ -63,19 +63,12 @@ except ImportError:
             dims = self.tensor[:, 3:6]
             rot = self.tensor[:, 6]
             origin = self.tensor.new_tensor(self.origin)
-            
             x_corners = [0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5]
             y_corners = [0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5]
             z_corners = [0, 0, 0, 0, 1, 1, 1, 1]
-            
-            corners_norm = torch.tensor(
-                np.stack([x_corners, y_corners, z_corners], axis=1),
-                dtype=self.tensor.dtype,
-                device=self.tensor.device
-            )
+            corners_norm = torch.tensor(np.stack([x_corners, y_corners, z_corners], axis=1), dtype=self.tensor.dtype, device=self.tensor.device)
             corners_norm = corners_norm - origin
             corners = dims.view([-1, 1, 3]) * corners_norm.view([1, 8, 3])
-            
             c = torch.cos(rot)
             s = torch.sin(rot)
             rot_mat = torch.zeros((len(rot), 3, 3), device=self.tensor.device)
@@ -84,63 +77,73 @@ except ImportError:
             rot_mat[:, 1, 0] = s
             rot_mat[:, 1, 1] = c
             rot_mat[:, 2, 2] = 1
-            
             corners = torch.bmm(corners, rot_mat.transpose(1, 2))
             corners += self.tensor[:, :3].view(-1, 1, 3)
             return corners
 
-    def points_cam2img(points_3d, proj_mat, with_depth=False):
-        points_shape = list(points_3d.shape)
-        points_shape[-1] = 1
-        d1, d2 = proj_mat.shape[:2]
-        if d1 == 3:
-            proj_mat_expanded = np.eye(4, dtype=proj_mat.dtype)
-            proj_mat_expanded[:d1, :d2] = proj_mat
-            proj_mat = proj_mat_expanded
-            
-        points_4 = np.concatenate([points_3d, np.ones(points_shape)], axis=-1)
-        point_2d = points_4 @ proj_mat.T
-        point_2d_res = point_2d[..., :2] / point_2d[..., 2:3]
+# --- 2. LOCAL VISUALIZATION (Overrides Library to fix np.int crash) ---
+def points_cam2img(points_3d, proj_mat, with_depth=False):
+    points_shape = list(points_3d.shape)
+    points_shape[-1] = 1
+    d1, d2 = proj_mat.shape[:2]
+    if d1 == 3:
+        proj_mat_expanded = np.eye(4, dtype=proj_mat.dtype)
+        proj_mat_expanded[:d1, :d2] = proj_mat
+        proj_mat = proj_mat_expanded
         
-        if with_depth:
-            return np.concatenate([point_2d_res, point_2d[..., 2:3]], axis=-1)
-        return point_2d_res
+    points_4 = np.concatenate([points_3d, np.ones(points_shape)], axis=-1)
+    point_2d = points_4 @ proj_mat.T
+    point_2d_res = point_2d[..., :2] / point_2d[..., 2:3]
+    
+    if with_depth:
+        return np.concatenate([point_2d_res, point_2d[..., 2:3]], axis=-1)
+    return point_2d_res
 
-    def plot_rect3d_on_img(img, num_bbox, imgfov_pts_2d, color=(0, 255, 0), thickness=1):
-        img = img.copy()
-        for i in range(num_bbox):
-            corners = imgfov_pts_2d[i].astype(int)
-            corners = np.clip(corners, -50000, 50000)
-            cv2.line(img, tuple(corners[4]), tuple(corners[5]), color, thickness)
-            cv2.line(img, tuple(corners[5]), tuple(corners[6]), color, thickness)
-            cv2.line(img, tuple(corners[6]), tuple(corners[7]), color, thickness)
-            cv2.line(img, tuple(corners[7]), tuple(corners[4]), color, thickness)
-            cv2.line(img, tuple(corners[0]), tuple(corners[1]), color, thickness)
-            cv2.line(img, tuple(corners[1]), tuple(corners[2]), color, thickness)
-            cv2.line(img, tuple(corners[2]), tuple(corners[3]), color, thickness)
-            cv2.line(img, tuple(corners[3]), tuple(corners[0]), color, thickness)
-            cv2.line(img, tuple(corners[0]), tuple(corners[4]), color, thickness)
-            cv2.line(img, tuple(corners[1]), tuple(corners[5]), color, thickness)
-            cv2.line(img, tuple(corners[2]), tuple(corners[6]), color, thickness)
-            cv2.line(img, tuple(corners[3]), tuple(corners[7]), color, thickness)
-        return img
+def plot_rect3d_on_img(img, num_bbox, imgfov_pts_2d, color=(0, 255, 0), thickness=1):
+    img = img.copy()
+    for i in range(num_bbox):
+        pts = imgfov_pts_2d[i]
+        pts = np.clip(pts, -10000, 10000) 
+        
+        # CRITICAL FIX: Use 'int' instead of 'np.int'
+        corners = pts.astype(int)
+        
+        cv2.line(img, tuple(corners[4]), tuple(corners[5]), color, thickness)
+        cv2.line(img, tuple(corners[5]), tuple(corners[6]), color, thickness)
+        cv2.line(img, tuple(corners[6]), tuple(corners[7]), color, thickness)
+        cv2.line(img, tuple(corners[7]), tuple(corners[4]), color, thickness)
+        cv2.line(img, tuple(corners[0]), tuple(corners[1]), color, thickness)
+        cv2.line(img, tuple(corners[1]), tuple(corners[2]), color, thickness)
+        cv2.line(img, tuple(corners[2]), tuple(corners[3]), color, thickness)
+        cv2.line(img, tuple(corners[3]), tuple(corners[0]), color, thickness)
+        cv2.line(img, tuple(corners[0]), tuple(corners[4]), color, thickness)
+        cv2.line(img, tuple(corners[1]), tuple(corners[5]), color, thickness)
+        cv2.line(img, tuple(corners[2]), tuple(corners[6]), color, thickness)
+        cv2.line(img, tuple(corners[3]), tuple(corners[7]), color, thickness)
+    return img
 
-    def draw_lidar_bbox3d_on_img(bboxes3d, raw_img, lidar2img_rt, img_metas, color=(0, 255, 0), thickness=1):
-        if hasattr(bboxes3d, 'tensor'):
-            corners_3d = bboxes3d.corners.detach().cpu().numpy()
-        else:
-            corners_3d = bboxes3d.corners
-        num_bbox = corners_3d.shape[0]
-        pts_4d = np.concatenate([corners_3d.reshape(-1, 3), np.ones((num_bbox * 8, 1))], axis=-1)
-        lidar2img_rt = copy.deepcopy(lidar2img_rt).reshape(4, 4)
-        if isinstance(lidar2img_rt, torch.Tensor):
-            lidar2img_rt = lidar2img_rt.cpu().numpy()
-        pts_2d = pts_4d @ lidar2img_rt.T
-        pts_2d[:, 2] = np.clip(pts_2d[:, 2], a_min=1e-5, a_max=1e5)
-        pts_2d[:, 0] /= pts_2d[:, 2]
-        pts_2d[:, 1] /= pts_2d[:, 2]
-        imgfov_pts_2d = pts_2d[..., :2].reshape(num_bbox, 8, 2)
-        return plot_rect3d_on_img(raw_img, num_bbox, imgfov_pts_2d, color, thickness)
+def draw_lidar_bbox3d_on_img(bboxes3d, raw_img, lidar2img_rt, img_metas, color=(0, 255, 0), thickness=1):
+    # Works with both library and local box objects
+    if hasattr(bboxes3d, 'tensor'):
+        corners_3d = bboxes3d.corners.detach().cpu().numpy()
+    else:
+        corners_3d = bboxes3d.corners
+        
+    num_bbox = corners_3d.shape[0]
+    pts_4d = np.concatenate([corners_3d.reshape(-1, 3), np.ones((num_bbox * 8, 1))], axis=-1)
+    lidar2img_rt = copy.deepcopy(lidar2img_rt).reshape(4, 4)
+    if isinstance(lidar2img_rt, torch.Tensor):
+        lidar2img_rt = lidar2img_rt.cpu().numpy()
+    
+    pts_2d = pts_4d @ lidar2img_rt.T
+    
+    # Clip depth to prevent division by zero or negative depth artifacts
+    pts_2d[:, 2] = np.clip(pts_2d[:, 2], a_min=0.1, a_max=1e5)
+    
+    pts_2d[:, 0] /= pts_2d[:, 2]
+    pts_2d[:, 1] /= pts_2d[:, 2]
+    imgfov_pts_2d = pts_2d[..., :2].reshape(num_bbox, 8, 2)
+    return plot_rect3d_on_img(raw_img, num_bbox, imgfov_pts_2d, color, thickness)
 
 # ========================================================================
 # HELPER: MATH & GEOMETRY
@@ -166,7 +169,7 @@ def bezier_interpolation(controls, n_points=50):
     return np.einsum('ij,njk->nik', A, controls)
 
 # ========================================================================
-# 1. VISUALIZATION ENGINE (V72 - CORRECTED)
+# 1. VISUALIZATION ENGINE
 # ========================================================================
 def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_idx, total):
     img_t = real_data['img']
@@ -195,10 +198,9 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
                 dense_lanes = bezier_interpolation(controls, n_points=40)
                 
                 for i, lane_pts_3d in enumerate(dense_lanes):
-                    # FIX: Threshold 0.35
                     if scores[i] > 0.35: 
-                        # FIX: Apply Z-shift to bring lanes down to ground
                         lane_lidar = lane_pts_3d.copy()
+                        # Z-Correction for ground alignment
                         lane_lidar[:, 2] -= LIDAR_HEIGHT_CORRECTION
                         
                         pts_2d_depth = points_cam2img(lane_lidar, l2i_np, with_depth=True)
@@ -217,7 +219,6 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
     if trajectory is not None and trajectory.dim() == 2 and trajectory.shape[0] > 0:
         if torch.max(torch.abs(trajectory)) > 0.01:
             traj_np = trajectory.detach().cpu().float().numpy()
-            # FIX: Apply Z-shift for trajectory
             z_vals = np.full((traj_np.shape[0], 1), -LIDAR_HEIGHT_CORRECTION)
             traj_3d = np.hstack((traj_np, z_vals))
             
@@ -245,24 +246,29 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
             scores = bbox_results[0][1]
             if isinstance(scores, torch.Tensor): scores = scores.detach().cpu().numpy()
             
-            # FIX: Threshold 0.25 to ensure we catch the front car
-            mask = scores > 0.25 
+            # Low threshold to catch car in rain
+            mask = scores > 0.1 
             
             if mask.any():
-                valid_boxes = bboxes_3d_tensor[mask].clone()
-                # FIX: Apply Z-shift to bring boxes down to ground
+                # Explicit CPU move
+                valid_boxes = bboxes_3d_tensor[mask].clone().detach().cpu()
+                # Z-Correction
                 valid_boxes[:, 2] -= LIDAR_HEIGHT_CORRECTION
                 
                 if valid_boxes.dim() == 1:
                     valid_boxes = valid_boxes.unsqueeze(0)
                 
+                # Use Library Structure (if available)
                 lidar_boxes = LiDARInstance3DBoxes(
                     valid_boxes, 
                     box_dim=valid_boxes.shape[-1], 
                     origin=(0.5, 0.5, 0)
                 )
+                
+                # USE LOCAL DRAW FUNCTION (Fixes crash)
                 img = draw_lidar_bbox3d_on_img(lidar_boxes, img, l2i_np, None, color=(0, 165, 255), thickness=2)
         except Exception as e:
+            print(f"[Warn] Box rendering skip: {e}")
             pass
 
     text = f'Frame {frame_idx+1}/{total}'
@@ -275,13 +281,8 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
     scale = W / 100.0
     cx, cy = W // 2, H // 2 + 200
 
-    # FIX: BEV Mapping with X/Y Swap
-    # User reported: Perpendicular lanes.
-    # Standard: X=Forward, Y=Left.
-    # If lanes appear horizontal (varying U, constant V), input data is (Y, X).
-    # We swap inputs to align: pt[1]=X (Forward) -> V, pt[0]=Y (Left) -> U.
     def world2pix(x, y):
-        # We assume input x=Y(Left), y=X(Forward) based on visual evidence
+        # BEV Mapping: X=Forward (V), Y=Left (U)
         u = int(cx - x * scale)
         v = int(cy - y * scale)
         return (u, v)
@@ -303,7 +304,6 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
                 
                 for i, lane_pts_3d in enumerate(dense_lanes):
                     if scores[i] > 0.35:
-                        # FIX: Swap coordinates (pt[0], pt[1])
                         pts_pix = np.array([world2pix(pt[0], pt[1]) for pt in lane_pts_3d], dtype=np.int32)
                         cv2.polylines(bev_img, [pts_pix.reshape((-1, 1, 2))], False, (100, 255, 100), 2)
         except:
@@ -322,7 +322,7 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
             labels = bbox_results[0][2]
             if isinstance(labels, torch.Tensor): labels = labels.detach().cpu().numpy()
             
-            mask = scores > 0.25
+            mask = scores > 0.1
             if mask.any():
                 valid_boxes = bboxes_3d[mask]
                 valid_labels = labels[mask]
@@ -330,7 +330,6 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
                 bev_corners = lidar_boxes.corners[:, [0, 3, 7, 4], :2].detach().cpu().numpy()
                 
                 for k, box_corners in enumerate(bev_corners):
-                    # FIX: Swap coordinates for boxes too
                     poly_pts = np.array([world2pix(c[0], c[1]) for c in box_corners], dtype=np.int32)
                     color = (0, 165, 255)
                     if valid_labels[k] >= 2: color = (255, 255, 0)
@@ -342,7 +341,6 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
     c = trajectories[current_idx]
     if c.dim() == 2 and torch.max(torch.abs(c)) > 0.01:
         c_np = c.detach().cpu().float().numpy()
-        # FIX: Swap coordinates
         pts_pix = [world2pix(p[0], p[1]) for p in c_np]
         for j in range(len(pts_pix)-1):
             cv2.line(bev_img, pts_pix[j], pts_pix[j+1], (0, 0, 255), 3)
@@ -840,7 +838,7 @@ def main():
     cfg = force_disable_flash_attn(cfg)
 
     print("="*80)
-    print("ORION STREAMING DEMO V72 (Z-CORRECTION & BEV SWAP)")
+    print("ORION STREAMING DEMO V76 (HYBRID FIX: LIB STRUCTURES + LOCAL DRAW)")
     print("="*80)
     
     print("Building model...")
