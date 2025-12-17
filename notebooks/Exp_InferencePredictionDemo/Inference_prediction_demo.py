@@ -1,9 +1,10 @@
 # ========================================================================
-# ORION INFERENCE DEMO V76 (HYBRID FIX: LIB STRUCTURES + LOCAL DRAW)
+# ORION INFERENCE DEMO V78 (FIX: FLATTENED MEDIAN + GROUND SHIFT)
 # ========================================================================
-# 1. FIXED: Forced LOCAL drawing functions to bypass 'np.int' library crash.
-# 2. RETAINED: Library 'LiDARInstance3DBoxes' (User Preference).
-# 3. RETAINED: Z-Correction (-1.85m) and thresholds (0.1) for detection.
+# 1. FIXED (Cam): Lanes are now Flattened (Median Z) AND Shifted (-1.85m)
+#    to fix the "hovering" issue seen in V77.
+# 2. RETAINED (Cam): Boxes use raw model output (no shift) as they are correct.
+# 3. RETAINED (BEV): Lateral Inversion (cx + x) to correct left/right flip.
 # ========================================================================
 
 import cv2
@@ -200,7 +201,14 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
                 for i, lane_pts_3d in enumerate(dense_lanes):
                     if scores[i] > 0.35: 
                         lane_lidar = lane_pts_3d.copy()
-                        # Z-Correction for ground alignment
+                        
+                        # --- FIX 1: FLATTEN + GROUND SHIFT ---
+                        # 1. Flatten: Snap all points to the median Z (removes waviness)
+                        median_z = np.median(lane_lidar[:, 2])
+                        lane_lidar[:, 2] = median_z
+                        
+                        # 2. Shift: If median is hovering (near 0), drop it to ground (-1.85)
+                        # We force the drop here because V77 confirmed they were hovering.
                         lane_lidar[:, 2] -= LIDAR_HEIGHT_CORRECTION
                         
                         pts_2d_depth = points_cam2img(lane_lidar, l2i_np, with_depth=True)
@@ -252,8 +260,10 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
             if mask.any():
                 # Explicit CPU move
                 valid_boxes = bboxes_3d_tensor[mask].clone().detach().cpu()
-                # Z-Correction
-                valid_boxes[:, 2] -= LIDAR_HEIGHT_CORRECTION
+                
+                # --- FIX 2: TRUST MODEL FOR BOXES ---
+                # User confirmed boxes are correct without Z-shift.
+                # valid_boxes[:, 2] -= LIDAR_HEIGHT_CORRECTION  <-- REMOVED
                 
                 if valid_boxes.dim() == 1:
                     valid_boxes = valid_boxes.unsqueeze(0)
@@ -282,8 +292,11 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
     cx, cy = W // 2, H // 2 + 200
 
     def world2pix(x, y):
-        # BEV Mapping: X=Forward (V), Y=Left (U)
-        u = int(cx - x * scale)
+        # BEV Mapping: X=Lateral, Y=Longitudinal (in this specific layout)
+        # --- FIX 3: LATERAL INVERSION (RETAINED) ---
+        # Changed 'cx - x' to 'cx + x' to flip Left/Right
+        # without changing the vertical axis.
+        u = int(cx + x * scale)
         v = int(cy - y * scale)
         return (u, v)
 
@@ -348,7 +361,7 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
     # 4. Ego Car
     ego_u, ego_v = world2pix(0, 0)
     pts_car = np.array([
-        [ego_u, ego_v - 15],       # Tip (Up)
+        [ego_u, ego_v - 15],        # Tip (Up)
         [ego_u + 10, ego_v + 10],  # Rear Right
         [ego_u, ego_v + 5],        # Indentation
         [ego_u - 10, ego_v + 10]   # Rear Left
@@ -838,7 +851,7 @@ def main():
     cfg = force_disable_flash_attn(cfg)
 
     print("="*80)
-    print("ORION STREAMING DEMO V76 (HYBRID FIX: LIB STRUCTURES + LOCAL DRAW)")
+    print("ORION STREAMING DEMO V78 (FIX: FLATTENED MEDIAN + GROUND SHIFT)")
     print("="*80)
     
     print("Building model...")
