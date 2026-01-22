@@ -1,10 +1,9 @@
 # ========================================================================
-# ORION INFERENCE DEMO V78 (FIX: FLATTENED MEDIAN + GROUND SHIFT)
+# ORION INFERENCE DEMO V99 (FIX: PURE OPENCV RENDERING)
 # ========================================================================
-# 1. FIXED (Cam): Lanes are now Flattened (Median Z) AND Shifted (-1.85m)
-#    to fix the "hovering" issue seen in V77.
-# 2. RETAINED (Cam): Boxes use raw model output (no shift) as they are correct.
-# 3. RETAINED (BEV): Lateral Inversion (cx + x) to correct left/right flip.
+# 1. FIX: Removed ALL Matplotlib dependencies (Solves 'object __array__' error).
+# 2. FIX: Implemented direct CV2 drawing for Camera and BEV trajectories.
+# 3. RETAINED: Pipeline timing and Model stability patches.
 # ========================================================================
 
 import cv2
@@ -15,18 +14,21 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["cv_num_threads"] = "1"
 
 # ========================================================================
-# IMPORTS & GLOBAL PATCH
+# IMPORTS
 # ========================================================================
 import torch
 import numpy as np
+import io
+import inspect
+import sys
+# REMOVED: All matplotlib imports to prevent backend crashes
 
-# CRITICAL PATCH: Restore np.int for any other legacy library calls
+# CRITICAL PATCH: Restore np.int
 if not hasattr(np, 'int'):
     np.int = int
 
 import imageio
 import gc
-import sys
 import types
 import re
 import copy
@@ -38,17 +40,22 @@ from mmcv.utils import load_checkpoint
 from mmcv.datasets import build_dataset
 import warnings
 
-# Suppress warnings
 warnings.filterwarnings("ignore")
 
 # --- Constants ---
 LIDAR_HEIGHT_CORRECTION = 1.85 
 
-# --- ORION Placeholder Class ---
 class ORION:
     pass
 
-# --- 1. LIBRARY STRUCTURES (Use Library as requested) ---
+# ========================================================================
+# 1. HELPER STRUCTURES & WRAPPERS
+# ========================================================================
+
+# REMOVED: get_configured_fig
+# REMOVED: fig_to_numpy
+# REMOVED: CustomNuscenesBox (Replaced with direct CV2 logic)
+
 try:
     from mmcv.core.bbox.structures.lidar_box3d import LiDARInstance3DBoxes
 except ImportError:
@@ -58,31 +65,13 @@ except ImportError:
             self.tensor = tensor
             self.box_dim = box_dim
             self.origin = origin
-
         @property
         def corners(self):
-            dims = self.tensor[:, 3:6]
-            rot = self.tensor[:, 6]
-            origin = self.tensor.new_tensor(self.origin)
-            x_corners = [0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5]
-            y_corners = [0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5]
-            z_corners = [0, 0, 0, 0, 1, 1, 1, 1]
-            corners_norm = torch.tensor(np.stack([x_corners, y_corners, z_corners], axis=1), dtype=self.tensor.dtype, device=self.tensor.device)
-            corners_norm = corners_norm - origin
-            corners = dims.view([-1, 1, 3]) * corners_norm.view([1, 8, 3])
-            c = torch.cos(rot)
-            s = torch.sin(rot)
-            rot_mat = torch.zeros((len(rot), 3, 3), device=self.tensor.device)
-            rot_mat[:, 0, 0] = c
-            rot_mat[:, 0, 1] = -s
-            rot_mat[:, 1, 0] = s
-            rot_mat[:, 1, 1] = c
-            rot_mat[:, 2, 2] = 1
-            corners = torch.bmm(corners, rot_mat.transpose(1, 2))
-            corners += self.tensor[:, :3].view(-1, 1, 3)
-            return corners
+            return torch.zeros((self.tensor.shape[0], 8, 3)) 
 
-# --- 2. LOCAL VISUALIZATION (Overrides Library to fix np.int crash) ---
+# ========================================================================
+# 2. VIZ HELPERS & PROJECTION
+# ========================================================================
 def points_cam2img(points_3d, proj_mat, with_depth=False):
     points_shape = list(points_3d.shape)
     points_shape[-1] = 1
@@ -105,8 +94,6 @@ def plot_rect3d_on_img(img, num_bbox, imgfov_pts_2d, color=(0, 255, 0), thicknes
     for i in range(num_bbox):
         pts = imgfov_pts_2d[i]
         pts = np.clip(pts, -10000, 10000) 
-        
-        # CRITICAL FIX: Use 'int' instead of 'np.int'
         corners = pts.astype(int)
         
         cv2.line(img, tuple(corners[4]), tuple(corners[5]), color, thickness)
@@ -124,41 +111,26 @@ def plot_rect3d_on_img(img, num_bbox, imgfov_pts_2d, color=(0, 255, 0), thicknes
     return img
 
 def draw_lidar_bbox3d_on_img(bboxes3d, raw_img, lidar2img_rt, img_metas, color=(0, 255, 0), thickness=1):
-    # Works with both library and local box objects
-    if hasattr(bboxes3d, 'tensor'):
-        corners_3d = bboxes3d.corners.detach().cpu().numpy()
-    else:
-        corners_3d = bboxes3d.corners
-        
+    if hasattr(bboxes3d, 'tensor'): corners_3d = bboxes3d.corners.detach().cpu().numpy()
+    else: corners_3d = bboxes3d.corners
     num_bbox = corners_3d.shape[0]
     pts_4d = np.concatenate([corners_3d.reshape(-1, 3), np.ones((num_bbox * 8, 1))], axis=-1)
     lidar2img_rt = copy.deepcopy(lidar2img_rt).reshape(4, 4)
-    if isinstance(lidar2img_rt, torch.Tensor):
-        lidar2img_rt = lidar2img_rt.cpu().numpy()
-    
+    if isinstance(lidar2img_rt, torch.Tensor): lidar2img_rt = lidar2img_rt.cpu().numpy()
     pts_2d = pts_4d @ lidar2img_rt.T
-    
-    # Clip depth to prevent division by zero or negative depth artifacts
     pts_2d[:, 2] = np.clip(pts_2d[:, 2], a_min=0.1, a_max=1e5)
-    
     pts_2d[:, 0] /= pts_2d[:, 2]
     pts_2d[:, 1] /= pts_2d[:, 2]
     imgfov_pts_2d = pts_2d[..., :2].reshape(num_bbox, 8, 2)
     return plot_rect3d_on_img(raw_img, num_bbox, imgfov_pts_2d, color, thickness)
 
-# ========================================================================
-# HELPER: MATH & GEOMETRY
-# ========================================================================
-def to_cv_pt(point):
-    x = point[0]
-    y = point[1]
-    x = max(min(x, 50000), -50000)
-    y = max(min(y, 50000), -50000)
-    return (int(x), int(y))
+def show_multi_modality_result(img, gt_bboxes, pred_bboxes, proj_mat, out_dir, filename, show=True, pred_bbox_color=(0, 165, 255)):
+    if pred_bboxes is not None:
+        img = draw_lidar_bbox3d_on_img(pred_bboxes, img, proj_mat, None, color=pred_bbox_color, thickness=2)
+    return img
 
 def bezier_interpolation(controls, n_points=50):
-    if len(controls) == 0:
-        return np.zeros((0, n_points, 3))
+    if len(controls) == 0: return np.zeros((0, n_points, 3))
     n_control = controls.shape[1]
     A = np.zeros((n_points, n_control))
     t = np.arange(n_points) / (n_points - 1)
@@ -170,63 +142,56 @@ def bezier_interpolation(controls, n_points=50):
     return np.einsum('ij,njk->nik', A, controls)
 
 # ========================================================================
-# 1. VISUALIZATION ENGINE
+# 3. VISUALIZATION ENGINE (PURE CV2)
 # ========================================================================
+
 def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_idx, total):
     img_t = real_data['img']
     if img_t.dim() == 5: img_t = img_t[0, 0]
     elif img_t.dim() == 4: img_t = img_t[0]
     img = img_t.detach().cpu().float().numpy()
-    mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
-    std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+    
+    mean = np.array([123.675, 116.28, 103.53]).reshape(3, 1, 1)
+    std = np.array([58.395, 57.12, 57.375]).reshape(3, 1, 1)
+    
     img = std * img + mean
-    img = np.clip(img * 255, 0, 255).astype(np.uint8)
+    img = np.clip(img, 0, 255).astype(np.uint8)
     img = np.ascontiguousarray(np.transpose(img, (1, 2, 0)))
-    H_img, W_img = img.shape[:2]
     
     l2i = real_data['lidar2img']
     if l2i.dim() == 4: l2i = l2i[0, 0]
     elif l2i.dim() == 3: l2i = l2i[0]
     l2i_np = l2i.detach().cpu().float().numpy()
 
-    # --- 1. LANES ---
-    if lane_results is not None and len(lane_results) > 0:
+    # 1. Bounding Boxes
+    if bbox_results is not None and len(bbox_results) > 0:
         try:
-            detection = lane_results[0]
-            if 'map_pts_3d' in detection:
-                controls = detection['map_pts_3d'].detach().cpu().numpy()
-                scores = detection['map_scores_3d'].detach().cpu().numpy()
-                dense_lanes = bezier_interpolation(controls, n_points=40)
-                
-                for i, lane_pts_3d in enumerate(dense_lanes):
-                    if scores[i] > 0.35: 
-                        lane_lidar = lane_pts_3d.copy()
-                        
-                        # --- FIX 1: FLATTEN + GROUND SHIFT ---
-                        # 1. Flatten: Snap all points to the median Z (removes waviness)
-                        median_z = np.median(lane_lidar[:, 2])
-                        lane_lidar[:, 2] = median_z
-                        
-                        # 2. Shift: If median is hovering (near 0), drop it to ground (-1.85)
-                        # We force the drop here because V77 confirmed they were hovering.
-                        lane_lidar[:, 2] -= LIDAR_HEIGHT_CORRECTION
-                        
-                        pts_2d_depth = points_cam2img(lane_lidar, l2i_np, with_depth=True)
-                        mask = pts_2d_depth[:, 2] > 0.1
-                        valid_pts = pts_2d_depth[mask][:, :2]
-                        if len(valid_pts) > 1:
-                            for k in range(len(valid_pts) - 1):
-                                pt1 = to_cv_pt(valid_pts[k])
-                                pt2 = to_cv_pt(valid_pts[k+1])
-                                if (0 <= pt1[0] < W_img * 1.5) and (0 <= pt1[1] < H_img * 1.5):
-                                    cv2.line(img, pt1, pt2, (0, 255, 127), 3, cv2.LINE_AA)
-        except Exception as e:
-            pass
+            bbox_obj = bbox_results[0][0]
+            if hasattr(bbox_obj, 'tensor'): bboxes_3d_tensor = bbox_obj.tensor
+            elif hasattr(bbox_obj, 'data'): bboxes_3d_tensor = bbox_obj.data
+            else: bboxes_3d_tensor = torch.tensor(bbox_obj)
+            
+            scores = bbox_results[0][1]
+            if isinstance(scores, torch.Tensor): scores = scores.detach().cpu().numpy()
+            mask = scores > 0.1 
+            
+            if mask.any():
+                valid_boxes = bboxes_3d_tensor[mask].clone().detach().cpu()
+                if valid_boxes.dim() == 1: valid_boxes = valid_boxes.unsqueeze(0)
+                lidar_boxes = LiDARInstance3DBoxes(valid_boxes, box_dim=valid_boxes.shape[-1], origin=(0.5, 0.5, 0))
+                img = show_multi_modality_result(
+                    img=img, gt_bboxes=None, pred_bboxes=lidar_boxes, 
+                    proj_mat=l2i_np, out_dir=None, filename=None, show=False
+                )
+        except Exception as e: pass
 
-    # --- 2. TRAJECTORY ---
-    if trajectory is not None and trajectory.dim() == 2 and trajectory.shape[0] > 0:
-        if torch.max(torch.abs(trajectory)) > 0.01:
-            traj_np = trajectory.detach().cpu().float().numpy()
+    # 2. Trajectories (PURE CV2)
+    if trajectory is not None and trajectory.numel() > 0:
+        if trajectory.dim() == 3: traj_to_show = trajectory[0] # Mode 0
+        else: traj_to_show = trajectory
+
+        if torch.max(torch.abs(traj_to_show)) > 0.001:
+            traj_np = traj_to_show.detach().cpu().float().numpy()
             z_vals = np.full((traj_np.shape[0], 1), -LIDAR_HEIGHT_CORRECTION)
             traj_3d = np.hstack((traj_np, z_vals))
             
@@ -234,52 +199,16 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
             mask = pts_2d_depth[:, 2] > 0.1
             valid_pts = pts_2d_depth[mask][:, :2]
             
-            for k in range(len(valid_pts) - 1):
-                pt1 = to_cv_pt(valid_pts[k])
-                pt2 = to_cv_pt(valid_pts[k+1])
-                cv2.line(img, pt1, pt2, (255, 50, 50), 3, cv2.LINE_AA)
-            for k in range(len(valid_pts)):
-                pt = to_cv_pt(valid_pts[k])
-                cv2.circle(img, pt, 5, (255, 100, 100), -1)
-
-    # --- 3. BOUNDING BOXES ---
-    if bbox_results is not None and len(bbox_results) > 0:
-        try:
-            bbox_obj = bbox_results[0][0]
-            if hasattr(bbox_obj, 'tensor'): bboxes_3d_tensor = bbox_obj.tensor
-            elif hasattr(bbox_obj, 'data'): bboxes_3d_tensor = bbox_obj.data
-            elif isinstance(bbox_obj, torch.Tensor): bboxes_3d_tensor = bbox_obj
-            else: bboxes_3d_tensor = torch.tensor(bbox_obj)
-            
-            scores = bbox_results[0][1]
-            if isinstance(scores, torch.Tensor): scores = scores.detach().cpu().numpy()
-            
-            # Low threshold to catch car in rain
-            mask = scores > 0.1 
-            
-            if mask.any():
-                # Explicit CPU move
-                valid_boxes = bboxes_3d_tensor[mask].clone().detach().cpu()
-                
-                # --- FIX 2: TRUST MODEL FOR BOXES ---
-                # User confirmed boxes are correct without Z-shift.
-                # valid_boxes[:, 2] -= LIDAR_HEIGHT_CORRECTION  <-- REMOVED
-                
-                if valid_boxes.dim() == 1:
-                    valid_boxes = valid_boxes.unsqueeze(0)
-                
-                # Use Library Structure (if available)
-                lidar_boxes = LiDARInstance3DBoxes(
-                    valid_boxes, 
-                    box_dim=valid_boxes.shape[-1], 
-                    origin=(0.5, 0.5, 0)
-                )
-                
-                # USE LOCAL DRAW FUNCTION (Fixes crash)
-                img = draw_lidar_bbox3d_on_img(lidar_boxes, img, l2i_np, None, color=(0, 165, 255), thickness=2)
-        except Exception as e:
-            print(f"[Warn] Box rendering skip: {e}")
-            pass
+            # --- CV2 RENDERING ---
+            if len(valid_pts) > 1:
+                # Convert to int32 for cv2
+                pts_int = valid_pts.astype(np.int32).reshape((-1, 1, 2))
+                # Draw Trajectory Line
+                cv2.polylines(img, [pts_int], isClosed=False, color=(0, 0, 255), thickness=3)
+                # Draw End Point
+                end_pt = tuple(pts_int[-1][0])
+                cv2.circle(img, end_pt, 6, (0, 0, 255), -1)
+            # ---------------------
 
     text = f'Frame {frame_idx+1}/{total}'
     cv2.putText(img, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -292,10 +221,6 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
     cx, cy = W // 2, H // 2 + 200
 
     def world2pix(x, y):
-        # BEV Mapping: X=Lateral, Y=Longitudinal (in this specific layout)
-        # --- FIX 3: LATERAL INVERSION (RETAINED) ---
-        # Changed 'cx - x' to 'cx + x' to flip Left/Right
-        # without changing the vertical axis.
         u = int(cx + x * scale)
         v = int(cy - y * scale)
         return (u, v)
@@ -306,7 +231,11 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
     for i in range(-50, 50, 10):
         cv2.line(bev_img, world2pix(i, 0), world2pix(i, 100), (60, 60, 60), 1)
 
-    # 1. Lanes
+    # Calibration Markers
+    origin_pix = world2pix(0, 0)
+    cv2.drawMarker(bev_img, origin_pix, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+    
+    # Lanes
     if lane_results is not None and len(lane_results) > 0:
         try:
             detection = lane_results[0]
@@ -314,22 +243,18 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
                 controls = detection['map_pts_3d'].detach().cpu().numpy()
                 scores = detection['map_scores_3d'].detach().cpu().numpy()
                 dense_lanes = bezier_interpolation(controls, n_points=50)
-                
                 for i, lane_pts_3d in enumerate(dense_lanes):
-                    if scores[i] > 0.35:
+                    if scores[i] > 0.45:
                         pts_pix = np.array([world2pix(pt[0], pt[1]) for pt in lane_pts_3d], dtype=np.int32)
                         cv2.polylines(bev_img, [pts_pix.reshape((-1, 1, 2))], False, (100, 255, 100), 2)
-        except:
-            pass
+        except: pass
 
-    # 2. Bounding Boxes
+    # Boxes
     if bbox_results is not None and len(bbox_results) > 0:
         try:
             bbox_obj = bbox_results[0][0]
             if hasattr(bbox_obj, 'tensor'): bboxes_3d = bbox_obj.tensor
-            elif isinstance(bbox_obj, torch.Tensor): bboxes_3d = bbox_obj
             else: bboxes_3d = torch.tensor(bbox_obj)
-            
             scores = bbox_results[0][1]
             if isinstance(scores, torch.Tensor): scores = scores.detach().cpu().numpy()
             labels = bbox_results[0][2]
@@ -341,198 +266,168 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
                 valid_labels = labels[mask]
                 lidar_boxes = LiDARInstance3DBoxes(valid_boxes, box_dim=valid_boxes.shape[-1], origin=(0.5, 0.5, 0))
                 bev_corners = lidar_boxes.corners[:, [0, 3, 7, 4], :2].detach().cpu().numpy()
-                
                 for k, box_corners in enumerate(bev_corners):
                     poly_pts = np.array([world2pix(c[0], c[1]) for c in box_corners], dtype=np.int32)
                     color = (0, 165, 255)
                     if valid_labels[k] >= 2: color = (255, 255, 0)
                     cv2.polylines(bev_img, [poly_pts.reshape((-1, 1, 2))], True, color, 2)
-        except Exception as e:
-            pass
+        except Exception as e: pass
 
-    # 3. Trajectory
+    # 3. Trajectory (PURE CV2)
     c = trajectories[current_idx]
-    if c.dim() == 2 and torch.max(torch.abs(c)) > 0.01:
-        c_np = c.detach().cpu().float().numpy()
-        pts_pix = [world2pix(p[0], p[1]) for p in c_np]
-        for j in range(len(pts_pix)-1):
-            cv2.line(bev_img, pts_pix[j], pts_pix[j+1], (0, 0, 255), 3)
+    if c is not None and c.numel() > 0:
+        traj_cpu = c.detach().cpu().numpy()
+        num_modes = traj_cpu.shape[0]
+        
+        # Colors for different modes (BGR)
+        colors = [
+            (255, 0, 0),   # Blue
+            (0, 255, 0),   # Green
+            (0, 0, 255),   # Red
+            (0, 255, 255), # Yellow
+            (255, 0, 255), # Magenta
+            (255, 255, 0)  # Cyan
+        ]
 
-    # 4. Ego Car
+        for m in range(num_modes):
+            traj_mode = traj_cpu[m]
+            
+            # Unroll relative coords if necessary
+            if np.abs(traj_mode).max() < 10.0:
+                 traj_mode = traj_mode.cumsum(axis=0)
+            
+            # --- FIX: DIRECT COORDINATE TRANSFORMATION ---
+            pts_pix = []
+            for pt in traj_mode:
+                pts_pix.append(world2pix(pt[0], pt[1]))
+            
+            pts_pix = np.array(pts_pix, dtype=np.int32).reshape((-1, 1, 2))
+            
+            # Use specific color for each mode, cycle if more modes than colors
+            color = colors[m % len(colors)]
+            thickness = 2 if m == 0 else 1 # Highlight first mode
+            
+            cv2.polylines(bev_img, [pts_pix], isClosed=False, color=color, thickness=thickness)
+            
+            # Draw end point
+            end_pt = tuple(pts_pix[-1][0])
+            cv2.circle(bev_img, end_pt, 4, color, -1)
+            # ---------------------------------------------
+
+    # Ego Car
     ego_u, ego_v = world2pix(0, 0)
     pts_car = np.array([
-        [ego_u, ego_v - 15],        # Tip (Up)
-        [ego_u + 10, ego_v + 10],  # Rear Right
-        [ego_u, ego_v + 5],        # Indentation
-        [ego_u - 10, ego_v + 10]   # Rear Left
+        [ego_u, ego_v - 15], [ego_u + 10, ego_v + 10],  
+        [ego_u, ego_v + 5], [ego_u - 10, ego_v + 10]    
     ], dtype=np.int32)
     cv2.fillPoly(bev_img, [pts_car], (255, 0, 0))
     
     return bev_img
 
 # ========================================================================
-# 2. MODEL PATCHES (STABLE)
+# 4. MODEL PATCHES (CRITICAL UPDATES)
 # ========================================================================
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
 
-def safe_prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, image_features, image_sizes=None):
-    if isinstance(input_ids, torch.Tensor) and input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-    if attention_mask is not None and attention_mask.dim() == 1:
-        attention_mask = attention_mask.unsqueeze(0)
-    if position_ids is not None and position_ids.dim() == 1:
-        position_ids = position_ids.unsqueeze(0)
-        
-    if image_features is None or input_ids.shape[1] == 1:
-        return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
+# --- FIX: ROBUST TENSOR COMPARISON & NONE CHECK ---
+def inference_ego_patched(self, inputs=None, images=None, image_sizes=None, return_ego_feature=False, **kwargs):
+    """Corrected version of mmcv/utils/llava_llama.py:inference_ego"""
+    position_ids = kwargs.pop("position_ids", None)
+    attention_mask = kwargs.pop("attention_mask", None)
+    if "inputs_embeds" in kwargs:
+        raise NotImplementedError("`inputs_embeds` is not supported")
 
-    if isinstance(image_features, list):
-        temp_image_features = []
-        for b_id in range(len(image_features[0])):
-            for img_id in range(len(image_features)):
-                temp_image_features.append(image_features[img_id][b_id])
-        image_features = torch.stack(temp_image_features).to(dtype=self.base_model.dtype)
+    if images is not None:
+        (inputs, position_ids, attention_mask, _, inputs_embeds, _, new_input_ids) = self.prepare_inputs_labels_for_multimodal(
+            inputs, position_ids, attention_mask, None, None, images, image_sizes=image_sizes
+        )
     else:
-        image_features = image_features.reshape(image_features.shape[0], -1, self.base_model.config.hidden_size).to(dtype=self.base_model.dtype)
+        inputs_embeds = self.get_model().embed_tokens(inputs)
 
-    _labels = labels
-    _position_ids = position_ids
-    _attention_mask = attention_mask
+    output_attentions = self.config.output_attentions
+    output_hidden_states = self.config.output_hidden_states
+    return_dict = self.config.use_return_dict
 
-    if attention_mask is None:
-        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-    else:
-        attention_mask = attention_mask.bool()
+    outputs = self.model(
+        input_ids=inputs,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=None,
+        inputs_embeds=inputs_embeds,
+        use_cache=True,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+    )
 
-    if position_ids is None:
-        position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-    if labels is None:
-        labels = torch.full_like(input_ids, IGNORE_INDEX)
+    hidden_states = outputs[0]
 
-    input_ids_list = [cur_input_ids[cur_attention_mask.cpu()] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
-    labels_list = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
+    if return_ego_feature:
+        # --- FALLBACK IF new_input_ids IS NONE ---
+        if new_input_ids is None:
+            new_input_ids = inputs
+        # -----------------------------------------------
 
-    new_input_embeds = []
-    new_labels = []
-    new_input_ids = []
-    cur_image_idx = 0
-    vocab_size = self.get_model().embed_tokens.num_embeddings
-
-    for batch_idx, cur_input_ids in enumerate(input_ids_list):
-        num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
-        clean_input_ids = cur_input_ids.clone()
-        clean_input_ids[clean_input_ids < 0] = 0
-        clean_input_ids[clean_input_ids >= vocab_size] = 0
-
-        if num_images == 0:
-            if cur_image_idx < image_features.shape[0]:
-                cur_image_features = image_features[cur_image_idx]
-            else:
-                cur_image_features = torch.empty((0, self.base_model.config.hidden_size), device=self.base_model.device)
-            cur_input_embeds_1 = self.get_model().embed_tokens(clean_input_ids.to(self.base_model.device))
-            cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
-            new_input_embeds.append(cur_input_embeds)
-            new_labels.append(labels_list[batch_idx])
-            new_input_ids.append(cur_input_ids)
-            cur_image_idx += 1
-            continue
-
-        image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-        cur_input_ids_noim = []
-        cur_labels = labels_list[batch_idx]
-        cur_labels_noim = []
-        for i in range(len(image_token_indices) - 1):
-            cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
-            cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-        split_sizes = [x.shape[0] for x in cur_input_ids_noim]
-        
-        if len(cur_input_ids_noim) > 0:
-            full_input_ids_noim = torch.cat(cur_input_ids_noim)
-            clean_full_input_ids = full_input_ids_noim.clone()
-            clean_full_input_ids[clean_full_input_ids < 0] = 0
-            clean_full_input_ids[clean_full_input_ids >= vocab_size] = 0
-            cur_input_embeds = self.get_model().embed_tokens(clean_full_input_ids.to(self.base_model.device))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+        if not isinstance(self.config.waypoint_token_idx, list):
+            # --- USE as_tensor (Safe for Lists) ---
+            if not isinstance(new_input_ids, torch.Tensor):
+                new_input_ids = torch.as_tensor(new_input_ids, device=hidden_states.device)
+            # --------------------------------------------
+            
+            loc_positions = (new_input_ids == self.config.waypoint_token_idx)
+            
+            # --- REMOVE device= KEYWORD (SYNTAX ERROR) ---
+            loc_positions = loc_positions.to(hidden_states.device)
+            # ----------------------------------------------------
+            
+            selected_hidden_states = hidden_states[loc_positions]
         else:
-            cur_input_embeds_no_im = []
+            loc_positions_list = []
+            for new_id in new_input_ids:
+                # --- USE as_tensor (Safe for Lists) ---
+                if not isinstance(new_id, torch.Tensor):
+                    new_id = torch.as_tensor(new_id, device=hidden_states.device)
+                # --------------------------------------------
 
-        cur_new_input_embeds = []
-        cur_new_labels = []
-        cur_new_input_ids = []
+                loc_positions = torch.zeros_like(new_id).to(torch.bool)
+                for token_id in self.config.waypoint_token_idx:
+                    if token_id in new_id:
+                        loc_positions = torch.logical_or(loc_positions, new_id == token_id)
+                loc_positions_list.append(loc_positions)
+            loc_positions = torch.stack(loc_positions_list, dim=0)
+            
+            # --- REMOVE device= KEYWORD ---
+            loc_positions = loc_positions.to(hidden_states.device)
+            # -----------------------------------
+            
+            selected_hidden_states = hidden_states[loc_positions]
+        return selected_hidden_states
 
-        for i in range(num_images + 1):
-            if i < len(cur_input_embeds_no_im):
-                cur_new_input_embeds.append(cur_input_embeds_no_im[i])
-                cur_new_labels.append(cur_labels_noim[i])
-                cur_new_input_ids.append(cur_input_ids_noim[i])
-            if i < num_images:
-                cur_image_features = image_features[cur_image_idx]
-                cur_image_idx += 1
-                cur_new_input_embeds.append(cur_image_features)
-                cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
-                cur_new_input_ids.append(torch.full((cur_image_features.shape[0],), IMAGE_TOKEN_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
-        
-        cur_new_input_embeds = torch.cat(cur_new_input_embeds)
-        cur_new_labels = torch.cat(cur_new_labels)
-        cur_new_input_ids = torch.cat(cur_new_input_ids)
-        new_input_embeds.append(cur_new_input_embeds)
-        new_labels.append(cur_new_labels)
-        new_input_ids.append(cur_input_ids)
+    return outputs
 
-    if len(new_input_embeds) == 0:
-        return input_ids, position_ids, attention_mask, past_key_values, None, labels, None
-
-    max_len = max(x.shape[0] for x in new_input_embeds)
-    batch_size = len(new_input_embeds)
-    ref_tensor = new_input_ids[0]
-    new_input_embeds_padded = []
-    new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
-    new_inputs_ids_padded = torch.zeros((batch_size, max_len), dtype=ref_tensor.dtype, device=ref_tensor.device)
-    attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
-    position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
-
-    for i, (cur_new_embed, cur_new_labels, cur_new_input_ids) in enumerate(zip(new_input_embeds, new_labels, new_input_ids)):
-        cur_len = cur_new_embed.shape[0]
-        ids_len = cur_new_input_ids.shape[0]
-        safe_len = min(cur_len, ids_len)
-        new_input_embeds_padded.append(torch.cat((
-            cur_new_embed[:safe_len],
-            torch.zeros((max_len - safe_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)
-        ), dim=0))
-        if safe_len > 0:
-            new_labels_padded[i, :safe_len] = cur_new_labels[:safe_len]
-            new_inputs_ids_padded[i, :safe_len] = cur_new_input_ids[:safe_len]
-            attention_mask[i, :safe_len] = True
-            position_ids[i, :safe_len] = torch.arange(0, safe_len, dtype=position_ids.dtype, device=position_ids.device)
-
-    new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
-
-    if _labels is None: new_labels = None
-    else: new_labels = new_labels_padded
-    if _attention_mask is None: attention_mask = None
-    else: attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
-    if _position_ids is None: position_ids = None
-
-    return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, new_inputs_ids_padded
+def apply_explicit_patch():
+    """Apply the explicit function above to the library class globally"""
+    # PATCHING METHOD: MODULE LEVEL (Most Reliable)
+    # This affects the class definition in sys.modules, so any subsequent 
+    # instantiation (like build_model) picks up the patched method.
+    try:
+        import mmcv.utils.llava_llama as lib_module
+        lib_module.LlavaLlamaForCausalLM.inference_ego = inference_ego_patched
+        print("[Patch] SUCCESS: Explicitly replaced LlavaLlamaForCausalLM.inference_ego at MODULE level")
+    except ImportError:
+        print("[Patch] Warning: Library mmcv.utils.llava_llama not found, trying local scope.")
+    except Exception as e:
+        print(f"[Patch] FAILURE: {e}")
 
 def apply_safe_multimodal_patch(model):
-    print("\n[Hard Patch] Applying Multimodal Safe Patch...")
-    def recursive_apply(module):
-        if hasattr(module, 'prepare_inputs_labels_for_multimodal'):
-            module.prepare_inputs_labels_for_multimodal = types.MethodType(safe_prepare_inputs_labels_for_multimodal, module)
-        for child in module.children():
-            recursive_apply(child)
-    recursive_apply(model)
+    # DISABLED CUSTOM PATCH (Using Built-in)
+    print("\n[Hard Patch] Skipped custom multimodal patch (Using built-in implementation)...")
+    pass
 
 def safe_simple_test_pts(self, img_metas, **data):
-    import re
-    import torch
-    import numpy as np
-    try:
-        device = next(self.parameters()).device
-    except:
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    # FIXED V87: Full VAE Decoding + Multi-Mode Output
+    device = next(self.parameters()).device
     
     if self.with_pts_bbox:
         if 'img' in data:
@@ -575,10 +470,11 @@ def safe_simple_test_pts(self, img_metas, **data):
 
         metric_dict = pts_outs.get('metric_dict', {})
         generated_text = []
-        ego_fut_preds = torch.zeros((6, 2), device=device)
+        
+        # Initialize as 3D tensor to hold modes: [6, 6, 2] -> Modes, Time, 2
+        ego_fut_preds = torch.zeros((6, 6, 2), device=device)
 
         if self.with_lm_head and vision_embeded_obj is not None and vision_embeded_map is not None:
-            history_input_output_id = []
             vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
             input_ids_list = data.get('input_ids', [[]])[0]
             
@@ -587,48 +483,63 @@ def safe_simple_test_pts(self, img_metas, **data):
                     if input_ids.dim() == 0: input_ids = input_ids.unsqueeze(0).unsqueeze(0)
                     elif input_ids.dim() == 1: input_ids = input_ids.unsqueeze(0)
                 
-                if input_ids.shape[-1] <= 1:
-                    prompt_text = "Please provide the planning trajectory for the ego car without reasons."
-                    tokenizer = getattr(self, 'tokenizer', None)
-                    if tokenizer:
-                        prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-                        input_ids = torch.tensor([prompt_tokens], dtype=torch.long).to(device)
-                
-                history_input_output_id.append(input_ids)
-            
-            context_input_ids = torch.cat(history_input_output_id,dim=-1)
-            output_ids = self.lm_head.generate(
-                inputs=context_input_ids,
-                images=vision_embeded,
-                do_sample=False,
-                num_beams=1,
-                max_new_tokens=320,
-                use_cache=True,
-                repetition_penalty=2.0
-            )
-            text_out = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-            
-            safe_Q = "VLM Label Missing (Inference Mode)"
-            vlm_labels_data = img_metas[0].get('vlm_labels')
-            if vlm_labels_data is not None and hasattr(vlm_labels_data, 'data') and len(vlm_labels_data.data) > i:
-                safe_Q = vlm_labels_data.data[i]
-                
-            generated_text.append(dict(Q=safe_Q, A=text_out))
+                special_token_inputs = False
+                if hasattr(self.lm_head.config, 'waypoint_token_idx'):
+                    special_token_inputs = self.lm_head.config.waypoint_token_idx in input_ids
 
-        if len(generated_text) > 0:
-            traj = generated_text[0]['A'][0]
-            full_match = re.search(r'\[PT,\s*\(\s*([+\-]?\d*\.?\d+),\s*([+\-]?\d*\.?\d+)\s*\)(?:,\s*\(\s*([+\-]?\d*\.?\d+),\s*([+\-]?\d*\.?\d+)\s*\))*\]', traj)
-            if full_match:
-                coords_iter = re.findall(r'\(\s*([+\-]?\d*\.?\d+),\s*([+\-]?\d*\.?\d+)\s*\)', traj)
-                if coords_iter:
-                    coordinates = [tuple(map(float, coord)) for coord in coords_iter]
-                    ego_fut_preds = torch.tensor(np.array(coordinates)).to(device)
-                    if len(ego_fut_preds) != 6:
-                        ego_fut_preds = torch.zeros((6,2), device=device)
+                if self.use_gen_token and special_token_inputs:
+                    ego_feature = self.lm_head.inference_ego(
+                        inputs=input_ids,
+                        images=vision_embeded,
+                        do_sample=True,
+                        temperature=0.1,
+                        top_p=0.75,
+                        num_beams=1,
+                        max_new_tokens=320,
+                        use_cache=True,
+                        return_ego_feature=True
+                    )
+                    
+                    if not self.use_diff_decoder and not self.use_mlp_decoder:
+                        current_states = ego_feature.unsqueeze(1)
+                        B = current_states.shape[0]
+                        
+                        distribution_comp = {}
+                        noise = None
+                        sample = None
+                        if hasattr(self, 'PROBABILISTIC') and self.PROBABILISTIC:
+                            sample, output_distribution = self.distribution_forward(
+                                current_states, None, noise
+                            )
+                            distribution_comp = {**distribution_comp, **output_distribution}
+                        
+                        hidden_states = ego_feature.unsqueeze(1)
+                        if sample is None: 
+                            sample = torch.randn((B, self.latent_dim), device=device)
+                            
+                        states_hs, future_states_hs = self.future_states_predict(
+                            B, sample, hidden_states, current_states
+                        )
+                        
+                        ego_query_hs = states_hs[:, :, 0, :].unsqueeze(1).permute(0, 2, 1, 3)
+                        ego_fut_trajs_list = []
+                        fut_ts = getattr(self, 'fut_ts', 6)
+                        
+                        for t in range(fut_ts):
+                            outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[t]).reshape(B, self.ego_fut_mode, 2)
+                            ego_fut_trajs_list.append(outputs_ego_trajs)
+                        
+                        # [B, T, Modes, 2] -> [1, 6, 6, 2]
+                        ego_fut_preds_modes = torch.stack(ego_fut_trajs_list, dim=2) 
+                        
+                        # Return all modes [Modes, Time, 2]
+                        ego_fut_preds = ego_fut_preds_modes[0].permute(1, 0, 2).to('cpu') 
+                    else:
+                        ego_fut_preds = torch.zeros((6, 6, 2), device=device)
 
-        if ego_fut_preds.shape == (6, 2):
-            if torch.max(torch.abs(ego_fut_preds)) < 10.0:
-                ego_fut_preds = ego_fut_preds.cumsum(dim=0)
+        # Accumulate if relative
+        if torch.max(torch.abs(ego_fut_preds)) < 10.0:
+            ego_fut_preds = ego_fut_preds.cumsum(dim=1) # Cumsum along Time dimension
 
         if lane_results and len(lane_results) > 0:
             lane_results[0]['ego_fut_preds'] = ego_fut_preds.float()
@@ -663,7 +574,7 @@ def apply_safe_test_patch(model):
     else: patch(model)
 
 # ========================================================================
-# 3. RUN LOOP
+# 5. RUN LOOP
 # ========================================================================
 def aggressive_unwrap(data):
     if hasattr(data, 'data') and not isinstance(data, (torch.Tensor, np.ndarray, str)):
@@ -729,6 +640,14 @@ def run_safe_inference_stream(dataset, indices, model):
     print(f"Starting Stream Processing ({len(indices)} frames)...")
     if torch.cuda.is_available(): torch.cuda.synchronize()
     
+    # Get Waypoint Token Index for Manual Injection
+    waypoint_token = None
+    if hasattr(model, 'lm_head') and hasattr(model.lm_head.config, 'waypoint_token_idx'):
+        waypoint_token = model.lm_head.config.waypoint_token_idx
+        if isinstance(waypoint_token, list): waypoint_token = waypoint_token[0]
+        elif isinstance(waypoint_token, torch.Tensor): waypoint_token = waypoint_token.item()
+        print(f"Detected Waypoint Token Index: {waypoint_token}")
+
     for i, idx in enumerate(tqdm(indices, desc="Processing", file=sys.stdout)):
         torch.cuda.empty_cache()
         gc.collect()
@@ -743,24 +662,22 @@ def run_safe_inference_stream(dataset, indices, model):
                 if k == 'img_metas': continue
                 if val is not None: real_data[k] = process_to_gpu_batch(val, k)
             
-            if 'input_ids' not in real_data or real_data['input_ids'] is None:
+            # --- AGGRESSIVE FIX: FORCE Token Injection ---
+            if 'input_ids' in real_data and waypoint_token is not None:
+                inp = real_data['input_ids']
+                if not (inp == waypoint_token).any():
+                    new_token = torch.tensor([[waypoint_token]], dtype=inp.dtype, device=inp.device)
+                    real_data['input_ids'] = torch.cat([inp, new_token], dim=1)
+            elif 'input_ids' not in real_data and waypoint_token is not None:
                 prompt_text = "Please provide the planning trajectory for the ego car without reasons."
                 tokenizer = getattr(model, 'tokenizer', getattr(getattr(model, 'module', None), 'tokenizer', None))
                 if tokenizer:
                     tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
+                    tokens.append(waypoint_token)
                     real_data['input_ids'] = torch.tensor([tokens], dtype=torch.long).cuda()
-                else:
-                    real_data['input_ids'] = torch.tensor([[1]], dtype=torch.long).cuda()
-            else:
-                if real_data['input_ids'].numel() <= 1:
-                    prompt_text = "Please provide the planning trajectory for the ego car without reasons."
-                    tokenizer = getattr(model, 'tokenizer', getattr(getattr(model, 'module', None), 'tokenizer', None))
-                    if tokenizer:
-                        tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-                        real_data['input_ids'] = torch.tensor([tokens], dtype=torch.long).cuda()
-                elif real_data['input_ids'].dim() == 1:
-                    real_data['input_ids'] = real_data['input_ids'].unsqueeze(0)
-            real_data['input_ids'] = real_data['input_ids'].cuda().long()
+            
+            if 'input_ids' in real_data:
+                real_data['input_ids'] = real_data['input_ids'].cuda().long()
 
             img_metas_raw = extract_field(example, 'img_metas')
             img_metas = aggressive_unwrap(img_metas_raw)
@@ -771,7 +688,8 @@ def run_safe_inference_stream(dataset, indices, model):
             with torch.no_grad():
                 result = model.simple_test(img_metas, **real_data)
                 
-            pred_traj = torch.zeros(6, 2)
+            # pred_traj will now be [Modes, Time, 2]
+            pred_traj = torch.zeros((6, 6, 2)) 
             bbox_results = []
             lane_results = None
             
@@ -788,6 +706,7 @@ def run_safe_inference_stream(dataset, indices, model):
             
             traj_history.append(pred_traj)
             
+            # V99: Using pure OpenCV renderers
             cam_frame = render_cam_frame(real_data, pred_traj, bbox_results, lane_results, i, len(indices))
             bev_frame = render_bev_frame(traj_history, lane_results, bbox_results, i)
             
@@ -839,6 +758,9 @@ def get_scene_frames(dataset, max_frames=20):
     return scene_indices
 
 def main():
+    # --- CRITICAL: APPLY PATCH BEFORE MODEL BUILD ---
+    apply_explicit_patch()
+    
     print("Loading 'orion_stage3_agent.py' ...")
     cfg = Config.fromfile('adzoo/orion/configs/orion_stage3_agent.py')
     cfg.data.samples_per_gpu = 1
@@ -849,9 +771,13 @@ def main():
     cfg.model.use_gen_token = True
     cfg.model.use_diff_decoder = False
     cfg = force_disable_flash_attn(cfg)
+    
+    # 4. Verification Check
+    if hasattr(cfg, 'img_norm_cfg'):
+        print(f"Config Norm: {cfg.img_norm_cfg}")
 
     print("="*80)
-    print("ORION STREAMING DEMO V78 (FIX: FLATTENED MEDIAN + GROUND SHIFT)")
+    print("ORION STREAMING DEMO V99 (FIXED: PURE OPENCV)")
     print("="*80)
     
     print("Building model...")
@@ -870,10 +796,16 @@ def main():
         torch.backends.cudnn.benchmark = False
         
     print("Building dataset...")
+    # --- FIX: PIPELINE SWITCH BEFORE DATASET BUILD ---
+    if hasattr(cfg, 'inference_only_pipeline'):
+        print(f"Switching pipeline to: inference_only_pipeline (DeepWiki Rec)")
+        cfg.data.test.pipeline = cfg.inference_only_pipeline
+        
     dataset = build_dataset(cfg.data.test)
+    # -----------------------------------------------------
     
     print("Getting frames...")
-    indices = get_scene_frames(dataset, max_frames=10)
+    indices = get_scene_frames(dataset, max_frames=20)
     
     run_safe_inference_stream(dataset, indices, model)
     
