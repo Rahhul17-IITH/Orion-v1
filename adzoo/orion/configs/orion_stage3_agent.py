@@ -342,7 +342,7 @@ inference_only_pipeline = [
             ),
             dict(
                 type='CustomCollect3D',
-                keys=['img','input_ids','ego_fut_cmd', 'vlm_labels','can_bus'] + collect_keys
+                keys=['img','input_ids','ego_fut_cmd', 'vlm_labels','can_bus','ego_pose','ego_pose_inv'] + collect_keys
             )
         ]
     )

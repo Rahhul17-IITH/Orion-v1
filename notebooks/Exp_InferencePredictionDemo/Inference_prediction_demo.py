@@ -1,9 +1,15 @@
 # ========================================================================
-# ORION INFERENCE DEMO V99 (FIX: PURE OPENCV RENDERING)
+# ORION INFERENCE DEMO V110 (FIX: MANUAL ZOOM & STABLE BEV)
 # ========================================================================
-# 1. FIX: Removed ALL Matplotlib dependencies (Solves 'object __array__' error).
-# 2. FIX: Implemented direct CV2 drawing for Camera and BEV trajectories.
-# 3. RETAINED: Pipeline timing and Model stability patches.
+# 1. FIX: BEV - switched to Direct Lane Rendering with CARLA Coords.
+# 2. FIX: Camera - Added specific coordinate scaling for Plotter.
+# 3. FIX: Removed Map API dependency to ensure real-time rendering stability.
+# 4. FIX: Implemented DeepWiki Rec: Use actual ego_pose for transformations.
+# 5. FIX: Added batch dimension handling for BOTH controls and ego_pose.
+# 6. FIX: Replaced Dynamic Scaling with FIXED MANUAL SCALE (Stable Zoom).
+# 7. FIX: Consistent Coordinate Transformation (Lanes/Boxes/Traj).
+# 8. FIX: Dual Axis Inversion (X- flip, Y+ orientation).
+# 9. FIX: Ego Marker Position extracted directly from Ego Pose Matrix.
 # ========================================================================
 
 import cv2
@@ -21,7 +27,22 @@ import numpy as np
 import io
 import inspect
 import sys
-# REMOVED: All matplotlib imports to prevent backend crashes
+from pyquaternion import Quaternion
+
+# --- PLOTTER IMPORT OR FALLBACK ---
+try:
+    from team_code.planner import Plotter
+except ImportError:
+    # Fallback Plotter Class matching CARLA API
+    class Plotter:
+        def __init__(self, size):
+            self.size = size
+            self.img = np.zeros((size, size, 3), dtype=np.uint8)
+        def dot(self, pos, node, color, r=2):
+            x, y = 5.5 * (pos - node)
+            x += self.size / 2
+            y += self.size / 2
+            cv2.circle(self.img, (int(x), int(y)), r, color, -1)
 
 # CRITICAL PATCH: Restore np.int
 if not hasattr(np, 'int'):
@@ -49,12 +70,41 @@ class ORION:
     pass
 
 # ========================================================================
-# 1. HELPER STRUCTURES & WRAPPERS
+# 1. HELPER STRUCTURES & COORDINATE SYSTEM
 # ========================================================================
 
-# REMOVED: get_configured_fig
-# REMOVED: fig_to_numpy
-# REMOVED: CustomNuscenesBox (Replaced with direct CV2 logic)
+def transform_reference_points_lane(reference_points, egopose, reverse=False, translation=True):
+    """
+    DeepWiki Recommendation [2]: Builtin Coordinate Transformation
+    """
+    reference_points = torch.cat([reference_points, torch.ones_like(reference_points[..., 0:1])], dim=-1)
+    if reverse:
+        matrix = egopose.inverse()
+    else:
+        matrix = egopose
+    if not translation:
+        matrix[..., :3, 3] = 0.0
+    reference_points = (matrix.unsqueeze(1).unsqueeze(1) @ reference_points.unsqueeze(-1)).squeeze(-1)[..., :3]
+    return reference_points
+
+class CarlacCoordinateSystem:
+    def __init__(self):
+        # LiDAR to ego transformation
+        self.lidar2ego = np.array([[ 0. ,  1. ,  0. , -0.39],
+                                   [-1. ,  0. ,  0. ,  0.  ],
+                                   [ 0. ,  0. ,  1. ,  1.84],
+                                   [ 0. ,  0. ,  0. ,  1.  ]])
+        
+        # BEV topdown transformation (Retained for legacy/fallback support)
+        topdown_extrinsics = np.array([[0.0, -0.0, -1.0, 50.0], 
+                                     [0.0, 1.0, -0.0, 0.0], 
+                                     [1.0, -0.0, 0.0, -0.0], 
+                                     [0.0, 0.0, 0.0, 1.0]])
+        topdown_intrinsics = np.array([[548.993771650447, 0.0, 256.0, 0], 
+                                     [0.0, 548.993771650447, 256.0, 0], 
+                                     [0.0, 0.0, 1.0, 0], 
+                                     [0, 0, 0, 1.0]])
+        self.coor2topdown = topdown_intrinsics @ topdown_extrinsics
 
 try:
     from mmcv.core.bbox.structures.lidar_box3d import LiDARInstance3DBoxes
@@ -72,6 +122,7 @@ except ImportError:
 # ========================================================================
 # 2. VIZ HELPERS & PROJECTION
 # ========================================================================
+
 def points_cam2img(points_3d, proj_mat, with_depth=False):
     points_shape = list(points_3d.shape)
     points_shape[-1] = 1
@@ -142,10 +193,10 @@ def bezier_interpolation(controls, n_points=50):
     return np.einsum('ij,njk->nik', A, controls)
 
 # ========================================================================
-# 3. VISUALIZATION ENGINE (PURE CV2)
+# 3. VISUALIZATION ENGINE (CARLA AGENT METHOD V2)
 # ========================================================================
 
-def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_idx, total):
+def render_cam_frame_carla_v2(real_data, trajectory, bbox_results, lane_results, frame_idx, total):
     img_t = real_data['img']
     if img_t.dim() == 5: img_t = img_t[0, 0]
     elif img_t.dim() == 4: img_t = img_t[0]
@@ -153,17 +204,11 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
     
     mean = np.array([123.675, 116.28, 103.53]).reshape(3, 1, 1)
     std = np.array([58.395, 57.12, 57.375]).reshape(3, 1, 1)
-    
     img = std * img + mean
     img = np.clip(img, 0, 255).astype(np.uint8)
     img = np.ascontiguousarray(np.transpose(img, (1, 2, 0)))
     
-    l2i = real_data['lidar2img']
-    if l2i.dim() == 4: l2i = l2i[0, 0]
-    elif l2i.dim() == 3: l2i = l2i[0]
-    l2i_np = l2i.detach().cpu().float().numpy()
-
-    # 1. Bounding Boxes
+    # 1. Bounding Boxes (Standard)
     if bbox_results is not None and len(bbox_results) > 0:
         try:
             bbox_obj = bbox_results[0][0]
@@ -179,77 +224,175 @@ def render_cam_frame(real_data, trajectory, bbox_results, lane_results, frame_id
                 valid_boxes = bboxes_3d_tensor[mask].clone().detach().cpu()
                 if valid_boxes.dim() == 1: valid_boxes = valid_boxes.unsqueeze(0)
                 lidar_boxes = LiDARInstance3DBoxes(valid_boxes, box_dim=valid_boxes.shape[-1], origin=(0.5, 0.5, 0))
+                l2i = real_data['lidar2img']
+                if l2i.dim() == 4: l2i = l2i[0, 0]
+                elif l2i.dim() == 3: l2i = l2i[0]
+                l2i_np = l2i.detach().cpu().float().numpy()
+                
                 img = show_multi_modality_result(
                     img=img, gt_bboxes=None, pred_bboxes=lidar_boxes, 
                     proj_mat=l2i_np, out_dir=None, filename=None, show=False
                 )
         except Exception as e: pass
 
-    # 2. Trajectories (PURE CV2)
+    # 2. Trajectory Rendering with Plotter (FIXED SCALING)
     if trajectory is not None and trajectory.numel() > 0:
-        if trajectory.dim() == 3: traj_to_show = trajectory[0] # Mode 0
+        if trajectory.dim() == 3: traj_to_show = trajectory[0]
         else: traj_to_show = trajectory
 
         if torch.max(torch.abs(traj_to_show)) > 0.001:
             traj_np = traj_to_show.detach().cpu().float().numpy()
-            z_vals = np.full((traj_np.shape[0], 1), -LIDAR_HEIGHT_CORRECTION)
+            z_vals = np.full((traj_np.shape[0], 1), -1.85)
             traj_3d = np.hstack((traj_np, z_vals))
+            
+            # Use CARLA's projection
+            l2i = real_data['lidar2img']
+            if l2i.dim() == 4: l2i = l2i[0, 0]
+            elif l2i.dim() == 3: l2i = l2i[0]
+            l2i_np = l2i.detach().cpu().float().numpy()
             
             pts_2d_depth = points_cam2img(traj_3d, l2i_np, with_depth=True)
             mask = pts_2d_depth[:, 2] > 0.1
             valid_pts = pts_2d_depth[mask][:, :2]
             
-            # --- CV2 RENDERING ---
-            if len(valid_pts) > 1:
-                # Convert to int32 for cv2
-                pts_int = valid_pts.astype(np.int32).reshape((-1, 1, 2))
-                # Draw Trajectory Line
-                cv2.polylines(img, [pts_int], isClosed=False, color=(0, 0, 255), thickness=3)
-                # Draw End Point
-                end_pt = tuple(pts_int[-1][0])
-                cv2.circle(img, end_pt, 6, (0, 0, 255), -1)
-            # ---------------------
+            # Initialize Plotter with fixed size matching original recommendation
+            plotter = Plotter(size=800) 
+            
+            for pt in valid_pts:
+                # FIXED: Apply specific scaling for Plotter coordinate system
+                plotter_x = (pt[0] - 400) / 5.5 
+                plotter_y = (pt[1] - 400) / 5.5
+                
+                try:
+                    plotter.dot(np.array([plotter_x, plotter_y]), np.array([0, 0]), color=(255, 255, 255), r=3)
+                except Exception as e:
+                    pass
+            
+            # Blend Plotter output
+            if hasattr(plotter, 'img') and np.sum(plotter.img) > 0:
+                plotter_img = np.array(plotter.img)
+                plotter_img = cv2.cvtColor(plotter_img, cv2.COLOR_RGB2BGR)
+                if plotter_img.shape[:2] != img.shape[:2]:
+                    plotter_img = cv2.resize(plotter_img, (img.shape[1], img.shape[0]))
+                
+                alpha = 0.8
+                img = cv2.addWeighted(img, 1-alpha, plotter_img, alpha, 0)
 
     text = f'Frame {frame_idx+1}/{total}'
     cv2.putText(img, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     return img
 
-def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
+def render_bev_frame_carla_v2(trajectories, lane_results, bbox_results, current_idx):
+    """
+    Updated BEV Rendering Pipeline with DeepWiki Recommendation:
+    - Centralized Ego Pose extraction.
+    - Applies transform_reference_points_lane (reverse=False) to Lanes, Boxes, and Trajectories.
+    - FIX: Dual Axis Inversion (X- flip, Y+).
+    - FIX: FIXED MANUAL SCALE (10.0) for stable zoom.
+    - FIX: Ego Marker Position extracted directly from Ego Pose Matrix.
+    """
     H, W = 800, 800
     bev_img = np.ones((H, W, 3), dtype=np.uint8) * 30
-    scale = W / 100.0
-    cx, cy = W // 2, H // 2 + 200
+    
+    # ==============================================================================
+    # 1. SETUP EGO POSE & COORDINATE SYSTEM
+    # ==============================================================================
+    ego_pose_tensor = None
+    
+    # Try to fetch ego_pose from lane_results (usually attached there)
+    if lane_results is not None and len(lane_results) > 0:
+        detection = lane_results[0]
+        ego_pose = detection.get('ego_pose', None)
+        if ego_pose is not None:
+            if isinstance(ego_pose, torch.Tensor): 
+                ego_pose_tensor = ego_pose.float().cuda()
+            elif isinstance(ego_pose, np.ndarray):
+                ego_pose_tensor = torch.from_numpy(ego_pose).float().cuda()
+    
+    # Ensure Batch Dimension for Transformation (B, 4, 4)
+    if ego_pose_tensor is not None and ego_pose_tensor.dim() == 2:
+        ego_pose_tensor = ego_pose_tensor.unsqueeze(0)
 
-    def world2pix(x, y):
-        u = int(cx + x * scale)
-        v = int(cy - y * scale)
+    # ==============================================================================
+    # 2. PRE-PROCESS TRAJECTORY (FOR RENDERING)
+    # ==============================================================================
+    traj_transformed = None
+    if trajectories is not None and current_idx < len(trajectories):
+        c = trajectories[current_idx]
+        if c is not None and c.numel() > 0:
+            # Prepare Data
+            traj_data = c.detach().clone() # (M, T, 2)
+            if traj_data.dim() == 2: traj_data = traj_data.unsqueeze(0)
+            
+            # 1. Accumulate Deltas if needed
+            if torch.max(torch.abs(traj_data)) < 10.0:
+                traj_data = traj_data.cumsum(dim=1)
+
+            # 2. Pad to 3D (Z=0)
+            z_pad = torch.zeros_like(traj_data[..., 0:1])
+            traj_3d = torch.cat([traj_data, z_pad], dim=-1)
+
+            # 3. Apply Transformation
+            if ego_pose_tensor is not None:
+                traj_3d = traj_3d.to(ego_pose_tensor.device).unsqueeze(0) # (1, M, T, 3)
+                traj_transformed = transform_reference_points_lane(
+                    traj_3d, ego_pose_tensor, reverse=False
+                )[0] # Back to (M, T, 3)
+            else:
+                traj_transformed = traj_3d
+
+    # ==============================================================================
+    # 3. FIXED MANUAL SCALE (SLIGHTLY ZOOMED IN)
+    # ==============================================================================
+    # Fixed scale for consistent zoom (10.0 is slightly more zoomed than default)
+    manual_scale = 6.0
+    center_x, center_y = 0.0, 0.0 # Keep centered on ego frame origin
+
+    # --- DUAL AXIS INVERSION ---
+    def world2pix_dynamic(x, y):
+        u = int(W/2 - (x - center_x) * manual_scale)
+        v = int(H/2 + (y - center_y) * manual_scale) 
         return (u, v)
 
-    # Grid
-    for i in range(-20, 120, 20):
-        cv2.line(bev_img, world2pix(-50, i), world2pix(50, i), (60, 60, 60), 1)
-    for i in range(-50, 50, 10):
-        cv2.line(bev_img, world2pix(i, 0), world2pix(i, 100), (60, 60, 60), 1)
-
-    # Calibration Markers
-    origin_pix = world2pix(0, 0)
-    cv2.drawMarker(bev_img, origin_pix, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
-    
-    # Lanes
+    # ==============================================================================
+    # 4. RENDER LANES
+    # ==============================================================================
     if lane_results is not None and len(lane_results) > 0:
         try:
             detection = lane_results[0]
             if 'map_pts_3d' in detection:
                 controls = detection['map_pts_3d'].detach().cpu().numpy()
                 scores = detection['map_scores_3d'].detach().cpu().numpy()
-                dense_lanes = bezier_interpolation(controls, n_points=50)
-                for i, lane_pts_3d in enumerate(dense_lanes):
+                labels = detection.get('map_labels_3d', None)
+                if labels is not None: labels = labels.detach().cpu().numpy()
+                
+                if ego_pose_tensor is not None:
+                    controls_tensor = torch.from_numpy(controls).cuda().unsqueeze(0)
+                    try:
+                        controls_transformed = transform_reference_points_lane(
+                            controls_tensor, ego_pose_tensor, reverse=False
+                        ).cpu().numpy()[0]
+                    except Exception:
+                        controls_transformed = controls
+                else:
+                    controls_transformed = controls
+                
+                dense_lanes = bezier_interpolation(controls_transformed, n_points=50)
+                
+                for i, lane_pts in enumerate(dense_lanes):
                     if scores[i] > 0.45:
-                        pts_pix = np.array([world2pix(pt[0], pt[1]) for pt in lane_pts_3d], dtype=np.int32)
-                        cv2.polylines(bev_img, [pts_pix.reshape((-1, 1, 2))], False, (100, 255, 100), 2)
-        except: pass
-
-    # Boxes
+                        color = (100, 255, 100)
+                        if labels is not None:
+                            lbl = int(labels[i])
+                            if lbl in [4, 5]: color = (255, 0, 255)
+                        pts_pix = [world2pix_dynamic(pt[0], pt[1]) for pt in lane_pts]
+                        pts_pix = np.array(pts_pix, dtype=np.int32)
+                        cv2.polylines(bev_img, [pts_pix.reshape((-1, 1, 2))], False, color, 2)
+        except Exception as e: print(f"Lane Render Error: {e}")
+    
+    # ==============================================================================
+    # 5. RENDER BOXES
+    # ==============================================================================
     if bbox_results is not None and len(bbox_results) > 0:
         try:
             bbox_obj = bbox_results[0][0]
@@ -260,68 +403,75 @@ def render_bev_frame(trajectories, lane_results, bbox_results, current_idx):
             labels = bbox_results[0][2]
             if isinstance(labels, torch.Tensor): labels = labels.detach().cpu().numpy()
             
-            mask = scores > 0.1
+            mask = scores > 0.1 
             if mask.any():
                 valid_boxes = bboxes_3d[mask]
                 valid_labels = labels[mask]
+                
                 lidar_boxes = LiDARInstance3DBoxes(valid_boxes, box_dim=valid_boxes.shape[-1], origin=(0.5, 0.5, 0))
-                bev_corners = lidar_boxes.corners[:, [0, 3, 7, 4], :2].detach().cpu().numpy()
+                corners_3d = lidar_boxes.corners 
+
+                if ego_pose_tensor is not None:
+                    corners_tensor = corners_3d.unsqueeze(0).to(ego_pose_tensor.device)
+                    corners_transformed = transform_reference_points_lane(
+                        corners_tensor, ego_pose_tensor, reverse=False
+                    )
+                    bev_corners = corners_transformed[0, :, [0, 3, 7, 4], :2].detach().cpu().numpy()
+                else:
+                    bev_corners = corners_3d[:, [0, 3, 7, 4], :2].detach().cpu().numpy()
+                
                 for k, box_corners in enumerate(bev_corners):
-                    poly_pts = np.array([world2pix(c[0], c[1]) for c in box_corners], dtype=np.int32)
+                    poly_pts = np.array([world2pix_dynamic(c[0], c[1]) for c in box_corners], dtype=np.int32)
                     color = (0, 165, 255)
                     if valid_labels[k] >= 2: color = (255, 255, 0)
                     cv2.polylines(bev_img, [poly_pts.reshape((-1, 1, 2))], True, color, 2)
         except Exception as e: pass
-
-    # 3. Trajectory (PURE CV2)
-    c = trajectories[current_idx]
-    if c is not None and c.numel() > 0:
-        traj_cpu = c.detach().cpu().numpy()
-        num_modes = traj_cpu.shape[0]
-        
-        # Colors for different modes (BGR)
-        colors = [
-            (255, 0, 0),   # Blue
-            (0, 255, 0),   # Green
-            (0, 0, 255),   # Red
-            (0, 255, 255), # Yellow
-            (255, 0, 255), # Magenta
-            (255, 255, 0)  # Cyan
-        ]
-
-        for m in range(num_modes):
-            traj_mode = traj_cpu[m]
-            
-            # Unroll relative coords if necessary
-            if np.abs(traj_mode).max() < 10.0:
-                 traj_mode = traj_mode.cumsum(axis=0)
-            
-            # --- FIX: DIRECT COORDINATE TRANSFORMATION ---
-            pts_pix = []
-            for pt in traj_mode:
-                pts_pix.append(world2pix(pt[0], pt[1]))
-            
-            pts_pix = np.array(pts_pix, dtype=np.int32).reshape((-1, 1, 2))
-            
-            # Use specific color for each mode, cycle if more modes than colors
-            color = colors[m % len(colors)]
-            thickness = 2 if m == 0 else 1 # Highlight first mode
-            
-            cv2.polylines(bev_img, [pts_pix], isClosed=False, color=color, thickness=thickness)
-            
-            # Draw end point
-            end_pt = tuple(pts_pix[-1][0])
-            cv2.circle(bev_img, end_pt, 4, color, -1)
-            # ---------------------------------------------
-
-    # Ego Car
-    ego_u, ego_v = world2pix(0, 0)
-    pts_car = np.array([
-        [ego_u, ego_v - 15], [ego_u + 10, ego_v + 10],  
-        [ego_u, ego_v + 5], [ego_u - 10, ego_v + 10]    
-    ], dtype=np.int32)
-    cv2.fillPoly(bev_img, [pts_car], (255, 0, 0))
     
+    # ==============================================================================
+    # 6. RENDER TRAJECTORY (Using Pre-Calculated Data)
+    # ==============================================================================
+    if traj_transformed is not None:
+        traj_cpu = traj_transformed.detach().cpu().numpy()
+        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (0, 255, 255), (255, 0, 255), (255, 255, 0)]
+
+        for m in range(traj_cpu.shape[0]):
+            traj_pts = traj_cpu[m] # (T, 3)
+            pts_pix = np.array([world2pix_dynamic(pt[0], pt[1]) for pt in traj_pts], dtype=np.int32).reshape((-1, 1, 2))
+            
+            color = colors[m % len(colors)]
+            thickness = 2 if m == 0 else 1
+            cv2.polylines(bev_img, [pts_pix], isClosed=False, color=color, thickness=thickness)
+    
+    # ==============================================================================
+    # 7. RENDER EGO VEHICLE (ALIGNED TO MATRIX TRANSLATION)
+    # ==============================================================================
+    # DEEPWIKI FIX: Extract position directly from Ego Pose Matrix (Ground Truth)
+    if ego_pose_tensor is not None:
+        # Extract translation (x, y) from the 4x4 transformation matrix
+        # Matrix shape: (1, 4, 4), we want index [0, 0, 3] and [0, 1, 3]
+        ego_x = ego_pose_tensor[0, 0, 3].item()
+        ego_y = ego_pose_tensor[0, 1, 3].item()
+    elif traj_transformed is not None:
+        # Fallback to trajectory start if no pose matrix
+        ego_x = traj_transformed[0, 0, 0].item()
+        ego_y = traj_transformed[0, 0, 1].item()
+    else:
+        ego_x, ego_y = 0.0, 0.0
+        
+    ego_u, ego_v = world2pix_dynamic(ego_x, ego_y)
+
+    if 0 <= ego_u < W and 0 <= ego_v < H:
+        # Draw enhanced red arrow
+        arrow_size = 20
+        arrow_points = [
+            (ego_u, ego_v - arrow_size),      # Tip
+            (ego_u - 8, ego_v + 8),           # Left base
+            (ego_u + 8, ego_v + 8)            # Right base
+        ]
+        cv2.drawContours(bev_img, [np.array(arrow_points)], 0, (0, 0, 255), -1)
+        # Draw circle outline
+        cv2.circle(bev_img, (ego_u, ego_v), 25, (0, 0, 255), 2)
+
     return bev_img
 
 # ========================================================================
@@ -364,31 +514,21 @@ def inference_ego_patched(self, inputs=None, images=None, image_sizes=None, retu
     hidden_states = outputs[0]
 
     if return_ego_feature:
-        # --- FALLBACK IF new_input_ids IS NONE ---
         if new_input_ids is None:
             new_input_ids = inputs
-        # -----------------------------------------------
 
         if not isinstance(self.config.waypoint_token_idx, list):
-            # --- USE as_tensor (Safe for Lists) ---
             if not isinstance(new_input_ids, torch.Tensor):
                 new_input_ids = torch.as_tensor(new_input_ids, device=hidden_states.device)
-            # --------------------------------------------
             
             loc_positions = (new_input_ids == self.config.waypoint_token_idx)
-            
-            # --- REMOVE device= KEYWORD (SYNTAX ERROR) ---
             loc_positions = loc_positions.to(hidden_states.device)
-            # ----------------------------------------------------
-            
             selected_hidden_states = hidden_states[loc_positions]
         else:
             loc_positions_list = []
             for new_id in new_input_ids:
-                # --- USE as_tensor (Safe for Lists) ---
                 if not isinstance(new_id, torch.Tensor):
                     new_id = torch.as_tensor(new_id, device=hidden_states.device)
-                # --------------------------------------------
 
                 loc_positions = torch.zeros_like(new_id).to(torch.bool)
                 for token_id in self.config.waypoint_token_idx:
@@ -396,21 +536,13 @@ def inference_ego_patched(self, inputs=None, images=None, image_sizes=None, retu
                         loc_positions = torch.logical_or(loc_positions, new_id == token_id)
                 loc_positions_list.append(loc_positions)
             loc_positions = torch.stack(loc_positions_list, dim=0)
-            
-            # --- REMOVE device= KEYWORD ---
             loc_positions = loc_positions.to(hidden_states.device)
-            # -----------------------------------
-            
             selected_hidden_states = hidden_states[loc_positions]
         return selected_hidden_states
 
     return outputs
 
 def apply_explicit_patch():
-    """Apply the explicit function above to the library class globally"""
-    # PATCHING METHOD: MODULE LEVEL (Most Reliable)
-    # This affects the class definition in sys.modules, so any subsequent 
-    # instantiation (like build_model) picks up the patched method.
     try:
         import mmcv.utils.llava_llama as lib_module
         lib_module.LlavaLlamaForCausalLM.inference_ego = inference_ego_patched
@@ -421,12 +553,10 @@ def apply_explicit_patch():
         print(f"[Patch] FAILURE: {e}")
 
 def apply_safe_multimodal_patch(model):
-    # DISABLED CUSTOM PATCH (Using Built-in)
     print("\n[Hard Patch] Skipped custom multimodal patch (Using built-in implementation)...")
     pass
 
 def safe_simple_test_pts(self, img_metas, **data):
-    # FIXED V87: Full VAE Decoding + Multi-Mode Output
     device = next(self.parameters()).device
     
     if self.with_pts_bbox:
@@ -471,7 +601,6 @@ def safe_simple_test_pts(self, img_metas, **data):
         metric_dict = pts_outs.get('metric_dict', {})
         generated_text = []
         
-        # Initialize as 3D tensor to hold modes: [6, 6, 2] -> Modes, Time, 2
         ego_fut_preds = torch.zeros((6, 6, 2), device=device)
 
         if self.with_lm_head and vision_embeded_obj is not None and vision_embeded_map is not None:
@@ -529,27 +658,29 @@ def safe_simple_test_pts(self, img_metas, **data):
                             outputs_ego_trajs = self.ego_fut_decoder(ego_query_hs[t]).reshape(B, self.ego_fut_mode, 2)
                             ego_fut_trajs_list.append(outputs_ego_trajs)
                         
-                        # [B, T, Modes, 2] -> [1, 6, 6, 2]
                         ego_fut_preds_modes = torch.stack(ego_fut_trajs_list, dim=2) 
-                        
-                        # Return all modes [Modes, Time, 2]
                         ego_fut_preds = ego_fut_preds_modes[0].permute(1, 0, 2).to('cpu') 
                     else:
                         ego_fut_preds = torch.zeros((6, 6, 2), device=device)
 
-        # Accumulate if relative
         if torch.max(torch.abs(ego_fut_preds)) < 10.0:
-            ego_fut_preds = ego_fut_preds.cumsum(dim=1) # Cumsum along Time dimension
+            ego_fut_preds = ego_fut_preds.cumsum(dim=1)
 
         if lane_results and len(lane_results) > 0:
             lane_results[0]['ego_fut_preds'] = ego_fut_preds.float()
             lane_results[0]['ego_fut_cmd'] = data.get('ego_fut_cmd', None)
             lane_results[0]['fut_valid_flag'] = True
+            # PASS EGO POSE IF AVAILABLE (from data)
+            if 'ego_pose' in data:
+                lane_results[0]['ego_pose'] = data['ego_pose'][0] if data['ego_pose'].dim() > 2 else data['ego_pose']
+
         else:
             if lane_results is None: lane_results = [{}]
             lane_results[0]['ego_fut_preds'] = ego_fut_preds.float()
             lane_results[0]['ego_fut_cmd'] = data.get('ego_fut_cmd', None)
             lane_results[0]['fut_valid_flag'] = True
+            if 'ego_pose' in data:
+                lane_results[0]['ego_pose'] = data['ego_pose'][0] if data['ego_pose'].dim() > 2 else data['ego_pose']
             
         return bbox_results, generated_text, lane_results, metric_dict
 
@@ -640,7 +771,6 @@ def run_safe_inference_stream(dataset, indices, model):
     print(f"Starting Stream Processing ({len(indices)} frames)...")
     if torch.cuda.is_available(): torch.cuda.synchronize()
     
-    # Get Waypoint Token Index for Manual Injection
     waypoint_token = None
     if hasattr(model, 'lm_head') and hasattr(model.lm_head.config, 'waypoint_token_idx'):
         waypoint_token = model.lm_head.config.waypoint_token_idx
@@ -662,7 +792,6 @@ def run_safe_inference_stream(dataset, indices, model):
                 if k == 'img_metas': continue
                 if val is not None: real_data[k] = process_to_gpu_batch(val, k)
             
-            # --- AGGRESSIVE FIX: FORCE Token Injection ---
             if 'input_ids' in real_data and waypoint_token is not None:
                 inp = real_data['input_ids']
                 if not (inp == waypoint_token).any():
@@ -688,7 +817,6 @@ def run_safe_inference_stream(dataset, indices, model):
             with torch.no_grad():
                 result = model.simple_test(img_metas, **real_data)
                 
-            # pred_traj will now be [Modes, Time, 2]
             pred_traj = torch.zeros((6, 6, 2)) 
             bbox_results = []
             lane_results = None
@@ -706,9 +834,9 @@ def run_safe_inference_stream(dataset, indices, model):
             
             traj_history.append(pred_traj)
             
-            # V99: Using pure OpenCV renderers
-            cam_frame = render_cam_frame(real_data, pred_traj, bbox_results, lane_results, i, len(indices))
-            bev_frame = render_bev_frame(traj_history, lane_results, bbox_results, i)
+            # V110: Updated Renderers with DeepWiki Fixes
+            cam_frame = render_cam_frame_carla_v2(real_data, pred_traj, bbox_results, lane_results, i, len(indices))
+            bev_frame = render_bev_frame_carla_v2(traj_history, lane_results, bbox_results, i)
             
             cam_writer.append_data(cam_frame)
             bev_writer.append_data(bev_frame)
@@ -723,7 +851,7 @@ def run_safe_inference_stream(dataset, indices, model):
     bev_writer.close()
     print("\n✓ Finished! Writers closed safely.")
 
-def get_scene_frames(dataset, max_frames=20):
+def get_scene_frames(dataset, max_frames=10):
     print("Scanning dataset for the first available scene...")
     first_token = None
     possible_keys = ['scene_token', 'scene', 'scene_id', 'token']
@@ -772,12 +900,11 @@ def main():
     cfg.model.use_diff_decoder = False
     cfg = force_disable_flash_attn(cfg)
     
-    # 4. Verification Check
     if hasattr(cfg, 'img_norm_cfg'):
         print(f"Config Norm: {cfg.img_norm_cfg}")
 
     print("="*80)
-    print("ORION STREAMING DEMO V99 (FIXED: PURE OPENCV)")
+    print("ORION STREAMING DEMO V110 (FIX: MANUAL ZOOM & STABLE BEV)")
     print("="*80)
     
     print("Building model...")
@@ -796,16 +923,14 @@ def main():
         torch.backends.cudnn.benchmark = False
         
     print("Building dataset...")
-    # --- FIX: PIPELINE SWITCH BEFORE DATASET BUILD ---
     if hasattr(cfg, 'inference_only_pipeline'):
         print(f"Switching pipeline to: inference_only_pipeline (DeepWiki Rec)")
         cfg.data.test.pipeline = cfg.inference_only_pipeline
         
     dataset = build_dataset(cfg.data.test)
-    # -----------------------------------------------------
     
     print("Getting frames...")
-    indices = get_scene_frames(dataset, max_frames=20)
+    indices = get_scene_frames(dataset, max_frames=10)
     
     run_safe_inference_stream(dataset, indices, model)
     
